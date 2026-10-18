@@ -1,0 +1,1010 @@
+{
+ "generated_at": 1792162001,
+ "factorio_root": "/home/cha14ka/.steam/steam/steamapps/common/Factorio",
+ "mods": {
+  "base": "2.0.77",
+  "core": "",
+  "elevated-rails": "2.0.77",
+  "quality": "2.0.77",
+  "space-age": "2.0.77"
+ },
+ "proto_types": 246,
+ "proto_count": 3943,
+ "types": {
+  "accumulator": {
+   "count": 1,
+   "bytes": 5804
+  },
+  "achievement": {
+   "count": 1,
+   "bytes": 261
+  },
+  "active-defense-equipment": {
+   "count": 2,
+   "bytes": 2001
+  },
+  "agricultural-tower": {
+   "count": 1,
+   "bytes": 21780
+  },
+  "airborne-pollutant": {
+   "count": 2,
+   "bytes": 632
+  },
+  "ammo": {
+   "count": 17,
+   "bytes": 18334
+  },
+  "ammo-category": {
+   "count": 17,
+   "bytes": 2517
+  },
+  "ammo-turret": {
+   "count": 3,
+   "bytes": 135436
+  },
+  "arithmetic-combinator": {
+   "count": 1,
+   "bytes": 13119
+  },
+  "armor": {
+   "count": 6,
+   "bytes": 9621
+  },
+  "arrow": {
+   "count": 2,
+   "bytes": 755
+  },
+  "artillery-flare": {
+   "count": 1,
+   "bytes": 482
+  },
+  "artillery-projectile": {
+   "count": 1,
+   "bytes": 1743
+  },
+  "artillery-turret": {
+   "count": 1,
+   "bytes": 8755
+  },
+  "artillery-wagon": {
+   "count": 1,
+   "bytes": 19290
+  },
+  "assembling-machine": {
+   "count": 12,
+   "bytes": 242206
+  },
+  "asteroid": {
+   "count": 16,
+   "bytes": 88594
+  },
+  "asteroid-chunk": {
+   "count": 15,
+   "bytes": 19591
+  },
+  "asteroid-collector": {
+   "count": 1,
+   "bytes": 16402
+  },
+  "autoplace-control": {
+   "count": 28,
+   "bytes": 4373
+  },
+  "battery-equipment": {
+   "count": 3,
+   "bytes": 1121
+  },
+  "beacon": {
+   "count": 1,
+   "bytes": 6410
+  },
+  "beam": {
+   "count": 7,
+   "bytes": 33419
+  },
+  "belt-immunity-equipment": {
+   "count": 1,
+   "bytes": 465
+  },
+  "blueprint": {
+   "count": 1,
+   "bytes": 1258
+  },
+  "blueprint-book": {
+   "count": 1,
+   "bytes": 760
+  },
+  "boiler": {
+   "count": 2,
+   "bytes": 18525
+  },
+  "build-entity-achievement": {
+   "count": 4,
+   "bytes": 939
+  },
+  "burner-generator": {
+   "count": 1,
+   "bytes": 2400
+  },
+  "burner-usage": {
+   "count": 3,
+   "bytes": 1710
+  },
+  "capsule": {
+   "count": 16,
+   "bytes": 24767
+  },
+  "capture-robot": {
+   "count": 1,
+   "bytes": 2199
+  },
+  "car": {
+   "count": 2,
+   "bytes": 79114
+  },
+  "cargo-bay": {
+   "count": 1,
+   "bytes": 81215
+  },
+  "cargo-landing-pad": {
+   "count": 1,
+   "bytes": 45647
+  },
+  "cargo-pod": {
+   "count": 1,
+   "bytes": 9867
+  },
+  "cargo-wagon": {
+   "count": 1,
+   "bytes": 11460
+  },
+  "chain-active-trigger": {
+   "count": 2,
+   "bytes": 859
+  },
+  "change-surface-achievement": {
+   "count": 4,
+   "bytes": 887
+  },
+  "character": {
+   "count": 1,
+   "bytes": 46070
+  },
+  "character-corpse": {
+   "count": 1,
+   "bytes": 3907
+  },
+  "cliff": {
+   "count": 5,
+   "bytes": 249690
+  },
+  "collision-layer": {
+   "count": 24,
+   "bytes": 1648
+  },
+  "combat-robot": {
+   "count": 3,
+   "bytes": 16626
+  },
+  "combat-robot-count-achievement": {
+   "count": 1,
+   "bytes": 213
+  },
+  "complete-objective-achievement": {
+   "count": 6,
+   "bytes": 1929
+  },
+  "constant-combinator": {
+   "count": 1,
+   "bytes": 4120
+  },
+  "construct-with-robots-achievement": {
+   "count": 2,
+   "bytes": 635
+  },
+  "construction-robot": {
+   "count": 1,
+   "bytes": 8353
+  },
+  "container": {
+   "count": 17,
+   "bytes": 38799
+  },
+  "copy-paste-tool": {
+   "count": 2,
+   "bytes": 1701
+  },
+  "corpse": {
+   "count": 177,
+   "bytes": 300806
+  },
+  "create-platform-achievement": {
+   "count": 1,
+   "bytes": 231
+  },
+  "curved-rail-a": {
+   "count": 1,
+   "bytes": 14630
+  },
+  "curved-rail-b": {
+   "count": 1,
+   "bytes": 14644
+  },
+  "custom-input": {
+   "count": 14,
+   "bytes": 2658
+  },
+  "damage-type": {
+   "count": 8,
+   "bytes": 389
+  },
+  "decider-combinator": {
+   "count": 1,
+   "bytes": 9766
+  },
+  "deconstruct-with-robots-achievement": {
+   "count": 1,
+   "bytes": 282
+  },
+  "deconstructible-tile-proxy": {
+   "count": 1,
+   "bytes": 245
+  },
+  "deconstruction-item": {
+   "count": 1,
+   "bytes": 1677
+  },
+  "delayed-active-trigger": {
+   "count": 100,
+   "bytes": 41681
+  },
+  "deliver-by-robots-achievement": {
+   "count": 2,
+   "bytes": 506
+  },
+  "deliver-category": {
+   "count": 2,
+   "bytes": 109
+  },
+  "deliver-impact-combination": {
+   "count": 15,
+   "bytes": 10450
+  },
+  "deplete-resource-achievement": {
+   "count": 1,
+   "bytes": 243
+  },
+  "destroy-cliff-achievement": {
+   "count": 1,
+   "bytes": 177
+  },
+  "display-panel": {
+   "count": 1,
+   "bytes": 4089
+  },
+  "dont-build-entity-achievement": {
+   "count": 2,
+   "bytes": 753
+  },
+  "dont-craft-manually-achievement": {
+   "count": 1,
+   "bytes": 246
+  },
+  "dont-kill-manually-achievement": {
+   "count": 1,
+   "bytes": 298
+  },
+  "dont-research-before-researching-achievement": {
+   "count": 1,
+   "bytes": 384
+  },
+  "dont-use-entity-in-energy-production-achievement": {
+   "count": 2,
+   "bytes": 638
+  },
+  "editor-controller": {
+   "count": 1,
+   "bytes": 765
+  },
+  "electric-energy-interface": {
+   "count": 2,
+   "bytes": 2002
+  },
+  "electric-pole": {
+   "count": 4,
+   "bytes": 10633
+  },
+  "electric-turret": {
+   "count": 2,
+   "bytes": 22354
+  },
+  "elevated-curved-rail-a": {
+   "count": 2,
+   "bytes": 98918
+  },
+  "elevated-curved-rail-b": {
+   "count": 2,
+   "bytes": 98753
+  },
+  "elevated-half-diagonal-rail": {
+   "count": 2,
+   "bytes": 51816
+  },
+  "elevated-straight-rail": {
+   "count": 2,
+   "bytes": 51340
+  },
+  "energy-shield-equipment": {
+   "count": 2,
+   "bytes": 954
+  },
+  "entity-ghost": {
+   "count": 5,
+   "bytes": 1553
+  },
+  "equip-armor-achievement": {
+   "count": 1,
+   "bytes": 329
+  },
+  "equipment-category": {
+   "count": 1,
+   "bytes": 54
+  },
+  "equipment-ghost": {
+   "count": 1,
+   "bytes": 211
+  },
+  "equipment-grid": {
+   "count": 5,
+   "bytes": 681
+  },
+  "explosion": {
+   "count": 225,
+   "bytes": 669465
+  },
+  "fire": {
+   "count": 14,
+   "bytes": 72647
+  },
+  "fish": {
+   "count": 1,
+   "bytes": 1195
+  },
+  "fluid": {
+   "count": 33,
+   "bytes": 9648
+  },
+  "fluid-turret": {
+   "count": 1,
+   "bytes": 55457
+  },
+  "fluid-wagon": {
+   "count": 1,
+   "bytes": 8428
+  },
+  "font": {
+   "count": 22,
+   "bytes": 2053
+  },
+  "fuel-category": {
+   "count": 5,
+   "bytes": 368
+  },
+  "furnace": {
+   "count": 4,
+   "bytes": 62276
+  },
+  "fusion-generator": {
+   "count": 1,
+   "bytes": 15671
+  },
+  "fusion-reactor": {
+   "count": 1,
+   "bytes": 12217
+  },
+  "gate": {
+   "count": 1,
+   "bytes": 5842
+  },
+  "generator": {
+   "count": 2,
+   "bytes": 9558
+  },
+  "generator-equipment": {
+   "count": 2,
+   "bytes": 778
+  },
+  "god-controller": {
+   "count": 1,
+   "bytes": 338
+  },
+  "group-attack-achievement": {
+   "count": 3,
+   "bytes": 1373
+  },
+  "gui-style": {
+   "count": 1,
+   "bytes": 221481
+  },
+  "gun": {
+   "count": 17,
+   "bytes": 30178
+  },
+  "half-diagonal-rail": {
+   "count": 1,
+   "bytes": 8724
+  },
+  "heat-interface": {
+   "count": 1,
+   "bytes": 936
+  },
+  "heat-pipe": {
+   "count": 1,
+   "bytes": 24100
+  },
+  "highlight-box": {
+   "count": 1,
+   "bytes": 79
+  },
+  "impact-category": {
+   "count": 8,
+   "bytes": 417
+  },
+  "infinity-cargo-wagon": {
+   "count": 1,
+   "bytes": 11922
+  },
+  "infinity-container": {
+   "count": 1,
+   "bytes": 3615
+  },
+  "infinity-pipe": {
+   "count": 1,
+   "bytes": 13658
+  },
+  "inserter": {
+   "count": 6,
+   "bytes": 76597
+  },
+  "inventory-bonus-equipment": {
+   "count": 1,
+   "bytes": 317
+  },
+  "item": {
+   "count": 241,
+   "bytes": 172108
+  },
+  "item-entity": {
+   "count": 1,
+   "bytes": 1222
+  },
+  "item-group": {
+   "count": 12,
+   "bytes": 1625
+  },
+  "item-request-proxy": {
+   "count": 1,
+   "bytes": 1277
+  },
+  "item-subgroup": {
+   "count": 136,
+   "bytes": 13879
+  },
+  "item-with-entity-data": {
+   "count": 7,
+   "bytes": 4699
+  },
+  "kill-achievement": {
+   "count": 8,
+   "bytes": 2182
+  },
+  "lab": {
+   "count": 2,
+   "bytes": 7634
+  },
+  "lamp": {
+   "count": 1,
+   "bytes": 4505
+  },
+  "land-mine": {
+   "count": 1,
+   "bytes": 1954
+  },
+  "lane-splitter": {
+   "count": 1,
+   "bytes": 5228
+  },
+  "legacy-curved-rail": {
+   "count": 1,
+   "bytes": 16234
+  },
+  "legacy-straight-rail": {
+   "count": 1,
+   "bytes": 15768
+  },
+  "lightning": {
+   "count": 1,
+   "bytes": 6856
+  },
+  "lightning-attractor": {
+   "count": 3,
+   "bytes": 10683
+  },
+  "linked-belt": {
+   "count": 1,
+   "bytes": 4145
+  },
+  "linked-container": {
+   "count": 1,
+   "bytes": 3335
+  },
+  "loader": {
+   "count": 4,
+   "bytes": 61286
+  },
+  "loader-1x1": {
+   "count": 1,
+   "bytes": 2546
+  },
+  "locomotive": {
+   "count": 1,
+   "bytes": 17583
+  },
+  "logistic-container": {
+   "count": 5,
+   "bytes": 20180
+  },
+  "logistic-robot": {
+   "count": 1,
+   "bytes": 6697
+  },
+  "map-gen-presets": {
+   "count": 1,
+   "bytes": 3165
+  },
+  "map-settings": {
+   "count": 1,
+   "bytes": 3097
+  },
+  "market": {
+   "count": 1,
+   "bytes": 773
+  },
+  "mining-drill": {
+   "count": 4,
+   "bytes": 140718
+  },
+  "module": {
+   "count": 12,
+   "bytes": 10225
+  },
+  "module-category": {
+   "count": 4,
+   "bytes": 229
+  },
+  "module-transfer-achievement": {
+   "count": 1,
+   "bytes": 276
+  },
+  "mouse-cursor": {
+   "count": 1,
+   "bytes": 166
+  },
+  "movement-bonus-equipment": {
+   "count": 1,
+   "bytes": 416
+  },
+  "night-vision-equipment": {
+   "count": 1,
+   "bytes": 697
+  },
+  "noise-expression": {
+   "count": 504,
+   "bytes": 137443
+  },
+  "noise-function": {
+   "count": 48,
+   "bytes": 20598
+  },
+  "offshore-pump": {
+   "count": 1,
+   "bytes": 15761
+  },
+  "particle-source": {
+   "count": 7,
+   "bytes": 3804
+  },
+  "pipe": {
+   "count": 1,
+   "bytes": 16515
+  },
+  "pipe-to-ground": {
+   "count": 1,
+   "bytes": 6574
+  },
+  "place-equipment-achievement": {
+   "count": 1,
+   "bytes": 301
+  },
+  "planet": {
+   "count": 5,
+   "bytes": 62883
+  },
+  "plant": {
+   "count": 3,
+   "bytes": 69791
+  },
+  "player-damaged-achievement": {
+   "count": 2,
+   "bytes": 523
+  },
+  "power-switch": {
+   "count": 1,
+   "bytes": 3316
+  },
+  "procession": {
+   "count": 10,
+   "bytes": 81933
+  },
+  "procession-layer-inheritance-group": {
+   "count": 2,
+   "bytes": 439
+  },
+  "produce-achievement": {
+   "count": 8,
+   "bytes": 2630
+  },
+  "produce-per-hour-achievement": {
+   "count": 9,
+   "bytes": 2704
+  },
+  "programmable-speaker": {
+   "count": 1,
+   "bytes": 37001
+  },
+  "projectile": {
+   "count": 30,
+   "bytes": 36533
+  },
+  "proxy-container": {
+   "count": 1,
+   "bytes": 3378
+  },
+  "pump": {
+   "count": 1,
+   "bytes": 45951
+  },
+  "quality": {
+   "count": 6,
+   "bytes": 1806
+  },
+  "radar": {
+   "count": 1,
+   "bytes": 3904
+  },
+  "rail-chain-signal": {
+   "count": 1,
+   "bytes": 95346
+  },
+  "rail-planner": {
+   "count": 2,
+   "bytes": 1715
+  },
+  "rail-ramp": {
+   "count": 2,
+   "bytes": 22155
+  },
+  "rail-remnants": {
+   "count": 6,
+   "bytes": 66450
+  },
+  "rail-signal": {
+   "count": 1,
+   "bytes": 94278
+  },
+  "rail-support": {
+   "count": 2,
+   "bytes": 2754
+  },
+  "reactor": {
+   "count": 2,
+   "bytes": 12441
+  },
+  "recipe": {
+   "count": 659,
+   "bytes": 438204
+  },
+  "recipe-category": {
+   "count": 29,
+   "bytes": 2101
+  },
+  "remote-controller": {
+   "count": 1,
+   "bytes": 76
+  },
+  "repair-tool": {
+   "count": 1,
+   "bytes": 660
+  },
+  "research-achievement": {
+   "count": 2,
+   "bytes": 413
+  },
+  "research-with-science-pack-achievement": {
+   "count": 12,
+   "bytes": 3475
+  },
+  "resource": {
+   "count": 12,
+   "bytes": 63035
+  },
+  "resource-category": {
+   "count": 3,
+   "bytes": 191
+  },
+  "roboport": {
+   "count": 1,
+   "bytes": 5960
+  },
+  "roboport-equipment": {
+   "count": 2,
+   "bytes": 2374
+  },
+  "rocket-silo": {
+   "count": 1,
+   "bytes": 16568
+  },
+  "rocket-silo-rocket": {
+   "count": 1,
+   "bytes": 3937
+  },
+  "rocket-silo-rocket-shadow": {
+   "count": 2,
+   "bytes": 508
+  },
+  "segment": {
+   "count": 60,
+   "bytes": 529477
+  },
+  "segmented-unit": {
+   "count": 3,
+   "bytes": 74967
+  },
+  "selection-tool": {
+   "count": 1,
+   "bytes": 822
+  },
+  "selector-combinator": {
+   "count": 1,
+   "bytes": 10434
+  },
+  "shoot-achievement": {
+   "count": 1,
+   "bytes": 238
+  },
+  "shortcut": {
+   "count": 19,
+   "bytes": 9153
+  },
+  "simple-entity": {
+   "count": 41,
+   "bytes": 180670
+  },
+  "simple-entity-with-force": {
+   "count": 1,
+   "bytes": 807
+  },
+  "simple-entity-with-owner": {
+   "count": 7,
+   "bytes": 8559
+  },
+  "smoke-with-trigger": {
+   "count": 101,
+   "bytes": 283018
+  },
+  "solar-panel": {
+   "count": 1,
+   "bytes": 1237
+  },
+  "solar-panel-equipment": {
+   "count": 1,
+   "bytes": 375
+  },
+  "space-connection": {
+   "count": 9,
+   "bytes": 32440
+  },
+  "space-connection-distance-traveled-achievement": {
+   "count": 3,
+   "bytes": 988
+  },
+  "space-location": {
+   "count": 3,
+   "bytes": 2251
+  },
+  "space-platform-hub": {
+   "count": 1,
+   "bytes": 66574
+  },
+  "space-platform-starter-pack": {
+   "count": 1,
+   "bytes": 6506
+  },
+  "spectator-controller": {
+   "count": 1,
+   "bytes": 81
+  },
+  "speech-bubble": {
+   "count": 1,
+   "bytes": 251
+  },
+  "spider-leg": {
+   "count": 14,
+   "bytes": 114936
+  },
+  "spider-unit": {
+   "count": 7,
+   "bytes": 87922
+  },
+  "spider-vehicle": {
+   "count": 1,
+   "bytes": 21722
+  },
+  "spidertron-remote": {
+   "count": 1,
+   "bytes": 1093
+  },
+  "splitter": {
+   "count": 4,
+   "bytes": 54479
+  },
+  "sprite": {
+   "count": 44,
+   "bytes": 11464
+  },
+  "sticker": {
+   "count": 21,
+   "bytes": 11733
+  },
+  "storage-tank": {
+   "count": 1,
+   "bytes": 11216
+  },
+  "straight-rail": {
+   "count": 1,
+   "bytes": 8468
+  },
+  "stream": {
+   "count": 14,
+   "bytes": 37645
+  },
+  "surface": {
+   "count": 1,
+   "bytes": 262
+  },
+  "surface-property": {
+   "count": 5,
+   "bytes": 430
+  },
+  "technology": {
+   "count": 275,
+   "bytes": 151996
+  },
+  "temporary-container": {
+   "count": 1,
+   "bytes": 1541
+  },
+  "thruster": {
+   "count": 1,
+   "bytes": 9163
+  },
+  "tile": {
+   "count": 150,
+   "bytes": 1369310
+  },
+  "tile-effect": {
+   "count": 14,
+   "bytes": 8204
+  },
+  "tile-ghost": {
+   "count": 1,
+   "bytes": 754
+  },
+  "tool": {
+   "count": 12,
+   "bytes": 12668
+  },
+  "train-path-achievement": {
+   "count": 1,
+   "bytes": 277
+  },
+  "train-stop": {
+   "count": 1,
+   "bytes": 17486
+  },
+  "transport-belt": {
+   "count": 4,
+   "bytes": 47879
+  },
+  "tree": {
+   "count": 32,
+   "bytes": 635413
+  },
+  "trigger-target-type": {
+   "count": 2,
+   "bytes": 135
+  },
+  "trivial-smoke": {
+   "count": 67,
+   "bytes": 35198
+  },
+  "turret": {
+   "count": 4,
+   "bytes": 72225
+  },
+  "tutorial": {
+   "count": 5,
+   "bytes": 503
+  },
+  "underground-belt": {
+   "count": 4,
+   "bytes": 21808
+  },
+  "unit": {
+   "count": 14,
+   "bytes": 158457
+  },
+  "unit-spawner": {
+   "count": 4,
+   "bytes": 26965
+  },
+  "upgrade-item": {
+   "count": 1,
+   "bytes": 1455
+  },
+  "use-entity-in-energy-production-achievement": {
+   "count": 4,
+   "bytes": 1099
+  },
+  "use-item-achievement": {
+   "count": 1,
+   "bytes": 308
+  },
+  "utility-constants": {
+   "count": 1,
+   "bytes": 140526
+  },
+  "utility-sounds": {
+   "count": 1,
+   "bytes": 13725
+  },
+  "utility-sprites": {
+   "count": 1,
+   "bytes": 118935
+  },
+  "valve": {
+   "count": 3,
+   "bytes": 7311
+  },
+  "virtual-signal": {
+   "count": 155,
+   "bytes": 27823
+  },
+  "wall": {
+   "count": 1,
+   "bytes": 8906
+  }
+ },
+ "skipped_types": [
+  "ambient-sound",
+  "optimized-decorative",
+  "optimized-particle",
+  "tips-and-tricks-item",
+  "tips-and-tricks-item-category"
+ ],
+ "locale_entries": {
+  "en": 6974,
+  "ru": 6970
+ }
+}

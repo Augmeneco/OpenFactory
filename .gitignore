@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# OpenFactory
+#
+# Tracked build inputs (NOT ignored):
+#   project.godot, scenes/, src/, assets/ (including assets/data JSON),
+#   addons/ except the local godot_ai MCP plugin, export_presets.cfg,
+#   icon.svg, README.md, tools/*.py, tools/*.sh and
+#   tools/factorio_extract/{extract.sh,convert.py,json.lua,serpent_stub.lua}.
+#
+# Ignored below: Godot caches and .import metadata (regenerated on import),
+# the local MCP editor plugin, Factorio artwork/dumps/staging, screenshots and
+# exported binaries.  tools/ itself is deliberately not ignored.
+# ---------------------------------------------------------------------------
+
+# Godot editor/import cache
+.godot/
+/android/
+.godot-userdata/
+.godot-config/
+
+# Local MCP editor plugin: development tool, not part of the game/repo
+/addons/godot_ai/
+
+# Godot import metadata (re-generated automatically from source assets)
+*.import
+
+# Offline render previews and generated screenshots
+/tmp_preview/
+
+# Factorio raw resources, generated dump and isolated extractor profile
+/factorio_data/
+/tools/factorio_extract/dump/
+/tools/factorio_extract/dump.zip
+/tools/factorio_extract/factorio-user/
+/tools/factorio_extract/fuser2/
+
+# Export staging and build artifacts (one-file Windows/Linux builds)
+/build/
+/dist/
+/.export_stage/
+*.pck
+
+# Python tooling caches
+__pycache__/
+*.py[cod]
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

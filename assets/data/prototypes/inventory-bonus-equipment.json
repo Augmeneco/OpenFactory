@@ -1,0 +1,1 @@
+{"toolbelt-equipment":{"type":"inventory-bonus-equipment","name":"toolbelt-equipment","sprite":{"filename":"__space-age__/graphics/equipment/toolbelt-equipment.png","width":192,"height":64,"priority":"medium","scale":0.5},"shape":{"width":3,"height":1,"type":"full"},"categories":["armor"],"inventory_size_bonus":10}}

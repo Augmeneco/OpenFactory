@@ -1,0 +1,1 @@
+{"chemical":{"type":"fuel-category","name":"chemical"},"nuclear":{"type":"fuel-category","name":"nuclear"},"food":{"type":"fuel-category","name":"food","fuel_value_type":["description.food-energy-value"]},"nutrients":{"type":"fuel-category","name":"nutrients","fuel_value_type":["description.nutrients-energy-value"]},"fusion":{"type":"fuel-category","name":"fusion"}}
