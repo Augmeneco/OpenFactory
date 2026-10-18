@@ -9,6 +9,21 @@
 энергосети, жидкости, логистические роботы, поезда, схемы, загрязнение, битвы,
 исследования, ручное крафт-меню, сохранения и интерфейс в стиле оригинала.
 
+## Скриншоты
+
+<table align="center">
+<tr>
+<td align="center"><a href="screenshots/1.png"><img src="screenshots/1.png" width="300" alt="1"></a><br><sub><b>1</b></sub></td>
+<td align="center"><a href="screenshots/2.png"><img src="screenshots/2.png" width="300" alt="2"></a><br><sub><b>2</b></sub></td>
+<td align="center"><a href="screenshots/3.png"><img src="screenshots/3.png" width="300" alt="3"></a><br><sub><b>3</b></sub></td>
+</tr>
+<tr>
+<td align="center"><a href="screenshots/4.png"><img src="screenshots/4.png" width="300" alt="4"></a><br><sub><b>4</b></sub></td>
+<td align="center"><a href="screenshots/5.png"><img src="screenshots/5.png" width="300" alt="5"></a><br><sub><b>5</b></sub></td>
+<td></td>
+</tr>
+</table>
+
 ---
 
 ## Быстрый старт
