@@ -40,7 +40,7 @@ func _init(player_: Player, world_: GameWorld, simulation_: Simulation,
 func _build() -> void:
 	steps = [
 		{"title": "Mine some iron ore by hand",
-			"detail": "Hold the right mouse button on an ore patch.",
+			"detail": "Hold the mouse button (or a finger) on an ore patch.",
 			"check": func() -> bool: return _has("iron-ore", 1)},
 		{"title": "Craft a stone furnace",
 			"detail": "Open the inventory and craft it from stone.",

@@ -6,6 +6,10 @@ extends RefCounted
 ## which is what lets the offline UI preview reproduce the interface without a
 ## GPU (see ``tools/preview_ui.py``).
 
+## Set by Game on a touch device.  Text buttons (especially Close/Back) get a
+## finger-sized minimum width and height instead of the desktop mouse target.
+static var touch_mode := false
+
 
 static func remember(control: Control, style_name: String, state := "default") -> Control:
 	control.set_meta("factorio_style", style_name)
@@ -77,7 +81,14 @@ static func button(text: String, style_name := "button") -> Button:
 	if not node.pressed.is_connected(_play_click):
 		node.pressed.connect(_play_click)
 	node.add_theme_font_override("font", FactorioStyle.font(style_name))
-	node.add_theme_font_size_override("font_size", FactorioStyle.font_size(style_name))
+	var font_size := FactorioStyle.font_size(style_name)
+	if touch_mode:
+		# Closing a window is the most important touch target in the whole UI.
+		var is_close := text == "Close" or text == "Back" or text == "Cancel"
+		node.custom_minimum_size = Vector2(150, 64) if is_close \
+			else Vector2(104, 52)
+		font_size = maxi(font_size, 20 if is_close else 17)
+	node.add_theme_font_size_override("font_size", font_size)
 	var pads := FactorioStyle.padding(style_name)
 	for state: String in ["default", "hovered", "clicked", "disabled"]:
 		var box := FactorioStyle.stylebox(style_name, state)

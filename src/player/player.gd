@@ -169,14 +169,22 @@ func tick(delta: float) -> void:
 	if camera == null:
 		return
 	_click_cooldown = maxf(0.0, _click_cooldown - delta)
+	if touch_mode:
+		_tick_touch(delta)
 	if driving != null:
 		_tick_driving(delta)
 	else:
 		_tick_character(delta)
 
-	var mouse_world := camera.mouse_world_position()
-	hover_cell = Vector2i(floor(mouse_world / TILE))
-	hover_valid = _in_reach(hover_cell)
+	if touch_mode:
+		if _touch_primary >= 0:
+			_touch_update_hover(_touch_pos)
+		elif virtual_mouse_enabled:
+			_touch_update_hover(virtual_mouse_position)
+	elif not (touch_mode and not _touch_points.is_empty()):
+		var mouse_world := camera.mouse_world_position()
+		hover_cell = Vector2i(floor(mouse_world / TILE))
+		hover_valid = _in_reach(hover_cell)
 	if _drag_building:
 		_tick_drag_building()
 	_tick_mining(delta)
@@ -196,6 +204,7 @@ func _movement_input() -> Vector2:
 		move.y -= 1.0
 	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):
 		move.y += 1.0
+	move += touch_move
 	return move.limit_length(1.0)
 
 
@@ -283,7 +292,8 @@ func _tick_character(delta: float) -> void:
 func _tick_mining(delta: float) -> void:
 	if character == null or driving != null:
 		return
-	if not _mouse_right_down or input_blocked or not hover_valid:
+	if not (_mouse_right_down or _touch_mining or _virtual_mouse_mining) \
+			or input_blocked or not hover_valid:
 		character.cancel_mining()
 		return
 	character.set_mining_target(hover_cell)
@@ -295,6 +305,316 @@ func _in_reach(cell: Vector2i) -> bool:
 		var player_cell := Vector2i(floor(camera.position / TILE))
 		return Vector2(player_cell).distance_to(Vector2(cell)) <= REACH_TILES
 	return character.within_reach(cell)
+
+
+# --------------------------------------------------------------------------
+# touch input
+# --------------------------------------------------------------------------
+
+## The gesture timer: a stationary finger with an empty hand mines after a
+## short hold.  Taps are handled on release so the same finger can still pan.
+func _tick_touch(delta: float) -> void:
+	if _touch_primary < 0 or _pinch_active:
+		return
+	if not _touch_points.has(_touch_primary):
+		return
+	_touch_elapsed += delta
+	if _touch_acted or _touch_moved or not held_item().is_empty():
+		return
+	if _touch_elapsed < 0.32:
+		return
+	_touch_acted = true
+	_touch_mining = true
+	_touch_update_hover(_touch_pos)
+
+
+func _touch_update_hover(point: Vector2) -> void:
+	if camera == null:
+		return
+	_touch_pos = point
+	var world_pos := camera.screen_to_world(point)
+	hover_cell = Vector2i(floor(world_pos / TILE))
+	hover_valid = _in_reach(hover_cell)
+
+
+func _handle_screen_touch(event: InputEventScreenTouch) -> void:
+	if event.pressed:
+		if _touch_suppressed:
+			return
+		_touch_points[event.index] = event.position
+		if _touch_points.size() == 1:
+			_begin_touch(event.index, event.position)
+		elif _touch_points.size() == 2:
+			_begin_pinch()
+		return
+	_touch_points.erase(event.index)
+	if _pinch_active:
+		if _touch_points.size() < 2:
+			_pinch_active = false
+		if _touch_points.is_empty():
+			_touch_suppressed = false
+		return
+	if event.index == _touch_primary:
+		_end_touch(event.position)
+	if _touch_points.is_empty():
+		_touch_suppressed = false
+
+
+func _handle_screen_drag(event: InputEventScreenDrag) -> void:
+	if _touch_points.has(event.index):
+		_touch_points[event.index] = event.position
+	if _pinch_active:
+		_update_pinch()
+		return
+	if event.index != _touch_primary:
+		return
+	var delta := event.position - _touch_pos
+	_touch_pos = event.position
+	_touch_update_hover(event.position)
+	if event.position.distance_to(_touch_start) > 14.0:
+		_touch_moved = true
+	if not _touch_moved:
+		return
+	if _touch_mining:
+		return
+	if _touch_building:
+		_tick_drag_building()
+		return
+	if camera == null:
+		return
+	if not _touch_camera_pan:
+		_touch_camera_pan = true
+		camera.follow_target = Vector2.INF
+	camera.position -= delta / maxf(0.01, camera.zoom_level)
+
+
+func _begin_touch(index: int, point: Vector2) -> void:
+	if _touch_suppressed:
+		return
+	if _point_over_own_hud(point):
+		return
+	if touch_ui_check.is_valid() and bool(touch_ui_check.call(point)):
+		return
+	_touch_primary = index
+	_touch_start = point
+	_touch_pos = point
+	_touch_elapsed = 0.0
+	_touch_moved = false
+	_touch_acted = false
+	_touch_mining = false
+	_touch_camera_pan = false
+	_touch_building = false
+	_touch_update_hover(point)
+	if not hover_valid:
+		return
+	var held := held_item()
+	if held.is_empty():
+		return
+	_touch_acted = true
+	_drag_pointer_down = true
+	_drag_last = hover_cell
+	_drag_item = held
+	# Tapping an existing machine must not open it: opening is a double tap
+	# now, so a held item over a machine only remembers the target.
+	var existing := world.entity_at(hover_cell)
+	_drag_building = existing == null and _can_start_drag()
+	_touch_building = _drag_building
+	if existing == null:
+		build_at_cursor()
+
+
+func _point_over_own_hud(point: Vector2) -> bool:
+	for control: Variant in [_hotbar_ui, _wire_bar, item_picker]:
+		if control is Control and (control as Control).visible 				and (control as Control).get_global_rect().has_point(point):
+			return true
+	return false
+
+
+func _end_touch(point: Vector2) -> void:
+	_touch_update_hover(point)
+	if _touch_mining and character != null:
+		character.cancel_mining()
+	var clean_tap := not _touch_moved and not _touch_camera_pan \
+		and not _touch_mining and not _touch_building \
+		and not input_blocked and hover_valid
+	var target: Entity = world.entity_at(hover_cell) if clean_tap else null
+	_touch_mining = false
+	_touch_building = false
+	_drag_building = false
+	_drag_pointer_down = false
+	if target != null:
+		_handle_entity_tap(target)
+	_touch_primary = -1
+	_touch_acted = false
+
+
+## A single tap arms the target; the second tap opens/picks/revives it.  This
+## keeps a long press free for mining and prevents an accidental tap from
+## opening a machine when the player is trying to break it.
+func _handle_entity_tap(target: Entity) -> void:
+	if target == null:
+		return
+	var now := Time.get_ticks_msec()
+	var same_cell := hover_cell == _last_tap_cell
+	if same_cell and now - _last_tap_ms <= DOUBLE_TAP_MS:
+		_last_tap_ms = 0
+		_last_tap_cell = Vector2i(999999, 999999)
+		build_at_cursor()
+		return
+	_last_tap_ms = now
+	_last_tap_cell = hover_cell
+
+
+func _begin_pinch() -> void:
+	_touch_suppressed = true
+	_pinch_active = true
+	_touch_mining = false
+	_touch_building = false
+	_touch_camera_pan = false
+	_drag_building = false
+	_drag_pointer_down = false
+	_touch_primary = -1
+	if character != null:
+		character.cancel_mining()
+	var keys := _touch_points.keys()
+	if keys.size() < 2:
+		return
+	var a: Vector2 = _touch_points[keys[0]]
+	var b: Vector2 = _touch_points[keys[1]]
+	_pinch_mid = (a + b) * 0.5
+	_pinch_distance = maxf(20.0, a.distance_to(b))
+	_pinch_zoom = camera.zoom_level if camera != null else 1.0
+
+
+func _update_pinch() -> void:
+	if camera == null or _touch_points.size() < 2:
+		return
+	var keys := _touch_points.keys()
+	var a: Vector2 = _touch_points[keys[0]]
+	var b: Vector2 = _touch_points[keys[1]]
+	var middle := (a + b) * 0.5
+	var distance := maxf(20.0, a.distance_to(b))
+	# Pinch is zoom only.  In particular it must never detach the camera from
+	# the engineer; only a deliberate one-finger pan (or map click) does that.
+	var anchor := get_viewport_rect().size * 0.5 \
+		if camera.follow_target.is_finite() else middle
+	camera.set_zoom_level(_pinch_zoom * distance / _pinch_distance, anchor)
+	_pinch_mid = middle
+
+
+## Move the emulated mouse pointer (right joystick).
+func set_virtual_pointer(point: Vector2) -> void:
+	virtual_mouse_enabled = true
+	virtual_mouse_position = point
+	if touch_mode and _touch_primary < 0 and not input_blocked:
+		_touch_update_hover(point)
+
+
+## Left mouse button at the virtual pointer.
+func virtual_left_click() -> void:
+	if not virtual_mouse_enabled:
+		return
+	_touch_update_hover(virtual_mouse_position)
+	if hover_valid and not input_blocked:
+		build_at_cursor()
+
+
+## Right mouse button: immediate secondary action first (wire/cursor/ghost),
+## otherwise hold-to-mine at the virtual pointer.
+func virtual_right_down() -> void:
+	if not virtual_mouse_enabled:
+		return
+	_touch_update_hover(virtual_mouse_position)
+	if input_blocked or not hover_valid:
+		return
+	var acted := secondary_action_at_hover()
+	_virtual_mouse_mining = not acted
+	if _virtual_mouse_mining and character != null:
+		character.set_mining_target(hover_cell)
+
+
+func virtual_right_up() -> void:
+	_virtual_mouse_mining = false
+	if character != null:
+		character.cancel_mining()
+
+
+## Called by the game when the touch HUD is hidden for a window/title screen.
+func reset_touch() -> void:
+	_touch_points.clear()
+	_touch_primary = -1
+	_touch_elapsed = 0.0
+	_touch_moved = false
+	_touch_acted = false
+	_touch_mining = false
+	_touch_camera_pan = false
+	_touch_building = false
+	_pinch_active = false
+	_touch_suppressed = false
+	_virtual_mouse_mining = false
+	touch_move = Vector2.ZERO
+	_drag_building = false
+	_drag_pointer_down = false
+
+
+## Rotate the machine under the finger, or the item being placed on bare
+## ground.  This is the same operation as the R key.
+func rotate_at_hover() -> void:
+	if not _rotate_entity_under_cursor():
+		build_direction = posmod(build_direction + 4, 16)
+	queue_redraw()
+
+
+## Q semantics for touch: put the cursor stack away, otherwise pick what is
+## under the finger (or clear the selected quickbar hand).
+func pick_or_clear() -> void:
+	if not cursor_item.is_empty():
+		return_cursor_item()
+		return
+	if hover_valid:
+		pick_from_cursor()
+	else:
+		_clear_hand_selection()
+
+
+## The secondary action from the MORE drawer: cancel a wire, return a cursor
+## stack, remove a ghost or pick up a ground item.  Long-press already mines
+## machines, so this is deliberately only for the immediate operations.
+func secondary_action_at_hover() -> bool:
+	if not wire_colour.is_empty():
+		cancel_wire()
+		return true
+	if not cursor_item.is_empty():
+		return_cursor_item()
+		return true
+	if not hover_valid:
+		return false
+	var target := world.entity_at(hover_cell)
+	if target == null:
+		return false
+	if target.is_ghost():
+		world.remove_entity(target)
+		FactorioAudio.play_utility("deconstruct_small", target.center())
+		inventory_changed.emit()
+		return true
+	if target.proto_type == "item-entity":
+		_pick_up_ground_item(target)
+		return true
+	return false
+
+
+## Cycle red wire -> green wire -> no wire, as Ctrl+W does on the desktop.
+func cycle_wire_colour() -> void:
+	if wire_colour == "":
+		wire_colour = CircuitNetwork.RED
+	elif wire_colour == CircuitNetwork.RED:
+		wire_colour = CircuitNetwork.GREEN
+	else:
+		wire_colour = ""
+	_wire_from = null
+	emit_signal("wiring_changed", wire_colour)
+	_update_wire_buttons()
+	queue_redraw()
 
 
 ## Set by the game while a window is open, so keystrokes do not reach the
@@ -311,8 +631,44 @@ var inventory_open := false
 ## the button is held and fills every cell between the last one and the new
 ## one, which is Factorio's belt-laying gesture.
 var _drag_building := false
+## The pointer that owns the current drag: the mouse or a screen finger.
+## ``_tick_drag_building`` used to ask the mouse directly, which made touch
+## drags stop after the first cell.
+var _drag_pointer_down := false
 var _drag_item := ""
 var _drag_last := Vector2i(999999, 999999)
+
+## Touch/mobile input.  The world is the primary surface: tap to use/build,
+## hold to mine, drag with an item to lay a line, drag empty-handed to pan.
+var touch_mode := false
+var touch_move := Vector2.ZERO
+var _touch_points: Dictionary = {}  ## finger index -> screen position
+var _touch_primary := -1
+var _touch_start := Vector2.ZERO
+var _touch_pos := Vector2.ZERO
+var _touch_elapsed := 0.0
+var _touch_moved := false
+var _touch_acted := false
+var _touch_mining := false
+var _touch_camera_pan := false
+var _touch_building := false
+var _touch_suppressed := false
+var _pinch_active := false
+var _pinch_distance := 1.0
+var _pinch_zoom := 1.0
+var _pinch_mid := Vector2.ZERO
+## Double-tap target (machine) tracking.  A single tap only remembers the
+## target; the second tap within DOUBLE_TAP_MS opens it.
+const DOUBLE_TAP_MS := 380
+var _last_tap_ms := 0
+var _last_tap_cell := Vector2i(999999, 999999)
+## Game-side guard for controls/panels that are not part of Player's quickbar.
+var touch_ui_check: Callable
+## Right joystick / LMB-RMB mouse emulation.  The pointer is in screen pixels;
+## Player converts it through the camera exactly like get_mouse_position().
+var virtual_mouse_enabled := false
+var virtual_mouse_position := Vector2.ZERO
+var _virtual_mouse_mining := false
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -322,6 +678,17 @@ func _unhandled_input(event: InputEvent) -> void:
 		# keys belong to the search box and the inventory itself.
 		if not (inventory_open and event is InputEventMouseButton):
 			return
+	if touch_mode and event is InputEventScreenTouch:
+		_handle_screen_touch(event)
+		return
+	if touch_mode and event is InputEventScreenDrag:
+		_handle_screen_drag(event)
+		return
+	# Android also sends an emulated mouse event for a touch.  The screen-touch
+	# path above owns world interaction; letting the mouse path run too would
+	# build or mine twice.
+	if touch_mode and (event is InputEventMouseButton 			or event is InputEventMouseMotion):
+		return
 	if event is InputEventMouseMotion and _copy_dragging:
 		copy_drag(hover_cell, true)
 		return
@@ -358,6 +725,7 @@ func _unhandled_input(event: InputEvent) -> void:
 		if not button.pressed:
 			if button.button_index == MOUSE_BUTTON_LEFT:
 				_drag_building = false
+				_drag_pointer_down = false
 				if _copy_dragging:
 					copy_drag(hover_cell, false)
 			return
@@ -377,6 +745,7 @@ func _unhandled_input(event: InputEvent) -> void:
 				_drag_last = hover_cell
 				_drag_item = held_item()
 				_drag_building = _can_start_drag()
+				_drag_pointer_down = true
 				build_at_cursor()
 		return
 	if event is InputEventKey and event.pressed and not event.echo:
@@ -1174,7 +1543,7 @@ func _can_start_drag() -> bool:
 func _tick_drag_building() -> void:
 	if not _drag_building:
 		return
-	if not Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+	if not _drag_pointer_down:
 		_drag_building = false
 		return
 	if _drag_item.is_empty() or _drag_item != held_item():
@@ -1640,19 +2009,28 @@ func _draw_build_preview() -> void:
 	var centre := entity.center() * TILE
 	var as_row := bool(data.get("is_row", false))
 	var offsets: Array = data.get("offsets", [])
+	var node_flips: Array = data.get("flip_nodes", [])
+	var nodes: Array = data["nodes"]
+	var row_nodes := int(data.get("row_nodes", nodes.size() if as_row else 0))
 	var node_index := 0
-	for graphics: Variant in data["nodes"]:
-		var tag := "preview/%s/d%d#%d" % [entity.name,
-			posmod(entity.direction, 16), node_index]
+	for graphics: Variant in nodes:
+		var state_tag := ""
+		if entity.proto_type == "underground-belt":
+			state_tag = "/" + str(entity.state.get("io", "input"))
+		var tag := "preview/%s/d%d%s#%d" % [entity.name,
+			posmod(entity.direction, 16), state_tag, node_index]
 		var shift := Vector2.ZERO
 		if node_index < offsets.size():
 			shift = Vector2(offsets[node_index]) * TILE
+		var use_row := as_row and node_index < row_nodes
+		var flipped := node_index < node_flips.size() \
+			and bool(node_flips[node_index])
 		node_index += 1
 		var variation := EntityVisuals.variation_for(entity,
 			_variation_count(graphics))
 		var layers: Array = SpriteCache.layers_row(graphics, direction, 0,
-			variation, tag) if as_row else SpriteCache.layers(graphics, direction,
-			0, variation, tag)
+			variation, tag) if use_row else SpriteCache.layers(graphics,
+			entity.direction, 0, variation, tag)
 		for layer: SpriteSource.Layer in layers:
 			var dest := Rect2(centre + shift + layer.offset - layer.size * 0.5,
 				layer.size)
@@ -1664,15 +2042,16 @@ func _draw_build_preview() -> void:
 			# the renderer reads too; `region` does not exist and asking for it
 			# crashed the preview outright.
 			var turned := spin + layer.rotation
-			if not is_zero_approx(turned):
-				draw_set_transform(dest.get_center(), turned, Vector2.ONE)
+			if not is_zero_approx(turned) or flipped:
+				draw_set_transform(dest.get_center(), turned,
+					Vector2(-1.0 if flipped else 1.0, 1.0))
 				dest = Rect2(-dest.size * 0.5, dest.size)
 			if layer.src_rect.size.x > 0.0:
 				draw_texture_rect_region(layer.texture, dest, layer.src_rect,
 					colour)
 			else:
 				draw_texture_rect(layer.texture, dest, false, colour)
-			if not is_zero_approx(turned):
+			if not is_zero_approx(turned) or flipped:
 				draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
 
 
@@ -1783,6 +2162,55 @@ func _draw_drill_output() -> void:
 		colour, false, 2.0)
 
 
+## While hovering either half of an underground belt, show the tunnel it
+## belongs to.  Factorio draws a dashed yellow line with arrows; the pair is
+## resolved from the world, so it also appears when the two halves were placed
+## in the opposite order.
+func _draw_underground_link() -> void:
+	if simulation == null:
+		return
+	var entity := world.entity_at(hover_cell)
+	if entity == null or entity.is_ghost() \
+			or entity.proto_type != "underground-belt":
+		return
+	var other := simulation.underground_link(entity)
+	if other == null:
+		return
+	var entrance := entity
+	var exit := other
+	if str(entity.state.get("io", "input")) == "output":
+		entrance = other
+		exit = entity
+	var from := entrance.center() * TILE
+	var to := exit.center() * TILE
+	var colour := Color(1.0, 0.82, 0.1, 0.95)
+	var delta := to - from
+	var distance := delta.length()
+	if distance < 1.0:
+		return
+	var direction := delta / distance
+	# Dashed shaft, then arrowheads pointing the way items travel.
+	var step := 9.0
+	var at := 0.0
+	while at < distance:
+		draw_line(from + direction * at,
+			from + direction * minf(at + step * 0.65, distance),
+			colour, 2.5, true)
+		at += step * 1.55
+	for fraction: float in [0.35, 0.7]:
+		var tip := from + delta * fraction
+		var side := Vector2(-direction.y, direction.x)
+		draw_colored_polygon(PackedVector2Array([
+			tip + direction * 7.0,
+			tip - direction * 4.0 + side * 5.0,
+			tip - direction * 4.0 - side * 5.0,
+		]), colour)
+	# Mark both ends so it is obvious which tiles the tunnel joins.
+	for point: Vector2 in [from, to]:
+		draw_rect(Rect2(point - Vector2(TILE, TILE) * 0.5,
+			Vector2(TILE, TILE)), colour, false, 2.0)
+
+
 ## Hovering an electric pole shows what it powers and how far its copper wire
 ## can reach.  The orange circle is the wire range used by PowerNetwork; the
 ## green square is the supply area.
@@ -1868,6 +2296,7 @@ func _draw() -> void:
 	_draw_pole_preview_wires()
 	_draw_inserter_guides()
 	_draw_drill_output()
+	_draw_underground_link()
 	_draw_pole_radius()
 	var rect := Rect2(Vector2(hover_cell) * TILE, Vector2(TILE, TILE))
 	var colour := Color(0.4, 1.0, 0.5, 0.55)

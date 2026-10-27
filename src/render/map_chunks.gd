@@ -161,6 +161,20 @@ func _tile_colour(tile: String) -> Color:
 	return _default_colour
 
 
+## Map colour of one cell, without rasterising a whole chunk.  The renderer
+## uses a handful of these as a temporary placeholder while the detailed
+## chunk bake is still running.
+func colour_at(cell: Vector2i, with_ore := true) -> Color:
+	var colour := _tile_colour(world.tile_at(cell))
+	if not with_ore:
+		return colour
+	var ore := world.ore_at(cell)
+	if str(ore["name"]).is_empty() or float(ore["amount"]) <= 0.0:
+		return colour
+	var ore_colour: Variant = _ore_colours.get(str(ore["name"]))
+	return ore_colour if ore_colour != null else colour
+
+
 ## Forget everything, for a new game or a load.
 func clear() -> void:
 	_entries.clear()

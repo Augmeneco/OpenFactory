@@ -17,13 +17,13 @@ config/icon="res://icon.svg"
 
 [autoload]
 
-_mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 Prototypes="*res://src/core/prototypes.gd"
 Defs="*res://src/core/defs.gd"
 Loc="*res://src/core/loc.gd"
 FactorioAssets="*res://src/core/factorio_assets.gd"
 FactorioStyle="*res://src/ui/factorio_style.gd"
 FactorioAudio="*res://src/core/factorio_audio.gd"
+_mcp_game_helper="*res://addons/godot_ai/runtime/game_helper.gd"
 
 [debug]
 
@@ -53,3 +53,4 @@ factorio_root="/home/cha14ka/.steam/steam/steamapps/common/Factorio"
 
 textures/canvas_textures/default_texture_filter=0
 rendering_device/driver.windows="d3d12"
+textures/vram_compression/import_etc2_astc=true

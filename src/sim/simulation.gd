@@ -194,8 +194,10 @@ static func splitter_tiles(splitter: Entity) -> Dictionary:
 
 ## Splitters hand each item on to one of the two belts in front, alternating.
 ##
-## Factorio's splitter merges both of its input belts and then round-robins the
-## result, which is what makes it useful for feeding two lines evenly.
+## Each belt lane is independent: an item travelling in the right lane may be
+## split between the right lanes of both output belts, but it can never cross
+## to the left lane.  That is what makes a splitter preserve lane flow instead
+## of mixing the two sides.
 func _update_splitters() -> void:
 	for splitter: Entity in live_of_type("splitter"):
 		var tiles := splitter_tiles(splitter)
@@ -208,39 +210,86 @@ func _update_splitters() -> void:
 			(tiles["left"] as Vector2i) - forward,
 			(tiles["right"] as Vector2i) - forward,
 		]
-		var next := int(splitter.state.get("next", 0))
-		for attempt in 2:
-			var out_index := (next + attempt) % 2
-			var out_belt := world.entity_at(outputs[out_index])
-			if not BeltSim.is_belt(out_belt):
-				continue
-			# Prefer the input on the same side, then fall back to the other.
-			var order: Array = [out_index, 1 - out_index]
-			for in_index: int in order:
-				var in_belt := world.entity_at(inputs[in_index])
-				if not BeltSim.is_belt(in_belt):
+		# One round-robin cursor per lane.  Old saves used a single int.
+		var next: Array = [0, 0]
+		var saved: Variant = splitter.state.get("next", null)
+		if saved is Array and (saved as Array).size() >= 2:
+			next = [int((saved as Array)[0]), int((saved as Array)[1])]
+		elif saved is int:
+			next = [int(saved), int(saved)]
+		for lane in BeltSim.LANES:
+			var moved := false
+			var start := int(next[lane])
+			for attempt in 2:
+				var out_index := (start + attempt) % 2
+				var out_belt := world.entity_at(outputs[out_index])
+				if not BeltSim.is_belt(out_belt):
 					continue
-				var item := _belt_ready_item(in_belt)
-				if item.is_empty():
-					continue
-				if BeltSim.try_insert(out_belt, str(item["name"]),
-						int(item["count"])) <= 0:
-					continue
-				BeltSim.take_one(in_belt)
-				splitter.state["next"] = 1 - out_index
-				stats["split"] = int(stats.get("split", 0)) + 1
-				break
+				# Prefer the input on the same side, then the other belt.
+				# Both must supply the same lane we are about to fill.
+				for in_index: int in [out_index, 1 - out_index]:
+					var in_belt := world.entity_at(inputs[in_index])
+					if not BeltSim.is_belt(in_belt):
+						continue
+					var item := _belt_ready_item(in_belt, lane)
+					if item.is_empty():
+						continue
+					# `false`: never fall back to the other lane.  Crossing
+					# lanes here was the source of items appearing on the
+					# wrong side of a splitter.
+					if BeltSim.try_insert(out_belt, str(item["name"]),
+							int(item["count"]), lane, false) <= 0:
+						continue
+					BeltSim.take_one(in_belt, lane)
+					next[lane] = 1 - out_index
+					stats["split"] = int(stats.get("split", 0)) + 1
+					moved = true
+					break
+				if moved:
+					break
+		splitter.state["next"] = next
 
 
 ## The leading item of a belt, but only once it has reached the far end.
-static func _belt_ready_item(belt: Entity) -> Dictionary:
+## ``lane`` limits the search to one belt lane (-1 means either lane).
+static func _belt_ready_item(belt: Entity, lane := -1) -> Dictionary:
 	var best: Dictionary = {}
 	for item: Dictionary in BeltSim.items_of(belt):
+		# Underground tunnel items use `travel` and have no lane/pos.
+		if not item.has("pos") or not item.has("lane"):
+			continue
 		if float(item["pos"]) < 0.75:
+			continue
+		if lane >= 0 and int(item["lane"]) != lane:
 			continue
 		if best.is_empty() or float(item["pos"]) > float(best["pos"]):
 			best = item
 	return best
+
+
+## The other half of an underground belt pair, from either end.
+##
+## Hovering an entrance looks forward for its exit; hovering the exit looks
+## back for its entrance.  The renderer uses this for the yellow link line.
+func underground_link(entity: Entity) -> Entity:
+	if entity == null or entity.proto_type != "underground-belt":
+		return null
+	if str(entity.state.get("io", "input")) != "output":
+		return _underground_partner(entity)
+	var proto := entity.prototype()
+	var max_distance := int(proto.get("max_distance", 5))
+	var step := BeltSim.dir_vector(entity.direction)
+	for k in range(1, max_distance + 1):
+		var other := world.entity_at(entity.origin - step * k)
+		if other == null:
+			continue
+		if other.proto_type != "underground-belt" or other.name != entity.name:
+			continue
+		if posmod(other.direction, 16) != posmod(entity.direction, 16):
+			continue
+		if str(other.state.get("io", "input")) == "input":
+			return other
+	return null
 
 
 ## The exit an underground belt entrance leads to, or ``null``.
@@ -278,44 +327,77 @@ func _update_underground_belts() -> void:
 		if span <= 0.0:
 			continue
 
-		var items: Array = belt.state.get("items", [])
-		belt.state["items"] = items
+		# A normal belt item can land in this state when a splitter/inserter
+		# feeds an underground half, or when the player rotates a half that
+		# was an exit into an entrance.  Tunnel items use `travel`, not
+		# `lane`/`pos`; convert anything else instead of crashing on the
+		# missing key.  Each lane keeps its own queue so a blocked right lane
+		# cannot stall the left one.
+		var lanes: Array = [[], []]
+		var raw: Variant = belt.state.get("items", [])
+		if raw is Array:
+			for entry: Variant in raw:
+				if not (entry is Dictionary):
+					continue
+				var item: Dictionary = entry
+				var item_lane := int(item.get("lane", 0))
+				if item_lane < 0 or item_lane >= BeltSim.LANES:
+					item_lane = 0
+				if item.has("travel"):
+					item["lane"] = item_lane
+					(lanes[item_lane] as Array).append(item)
+				elif item.has("name") and item.has("count"):
+					(lanes[item_lane] as Array).append({"name": str(item["name"]),
+						"count": int(item["count"]), "travel": 0.0,
+						"lane": item_lane})
 
-		# Push whatever has arrived out of the far end.
-		while not items.is_empty() and float(items[0]["travel"]) >= span:
-			var ahead := world.entity_at(exit.origin + BeltSim.dir_vector(exit.direction))
-			if not BeltSim.is_belt(ahead):
-				break
-			var head: Dictionary = items[0]
-			if BeltSim.try_insert(ahead, str(head["name"]), int(head["count"])) <= 0:
-				break
-			items.remove_at(0)
-			stats["tunnelled"] = int(stats.get("tunnelled", 0)) + int(head["count"])
+		var behind := world.entity_at(
+			belt.origin - BeltSim.dir_vector(belt.direction))
+		for lane in BeltSim.LANES:
+			var queue: Array = lanes[lane]
+			# Push whatever has arrived out of the far end.  Keep the lane the
+			# item entered on: it must leave on that same lane, not be balanced
+			# to whichever output lane happens to have room.
+			while not queue.is_empty() and float(queue[0]["travel"]) >= span:
+				var ahead := world.entity_at(
+					exit.origin + BeltSim.dir_vector(exit.direction))
+				if not BeltSim.is_belt(ahead):
+					break
+				var head: Dictionary = queue[0]
+				if BeltSim.try_insert(ahead, str(head["name"]),
+						int(head["count"]), lane, false) <= 0:
+					break
+				queue.remove_at(0)
+				stats["tunnelled"] = int(stats.get("tunnelled", 0)) + int(head["count"])
 
-		# Advance the queue, keeping the tunnel's own item spacing.
-		for index in items.size():
-			var item: Dictionary = items[index]
-			var limit := span
-			if index > 0:
-				limit = float(items[index - 1]["travel"]) - BeltSim.SPACING
-			item["travel"] = minf(limit, float(item["travel"]) + speed)
+			# Advance this lane's queue with its own spacing.
+			for index in queue.size():
+				var item: Dictionary = queue[index]
+				var limit := span
+				if index > 0:
+					limit = float(queue[index - 1]["travel"]) - BeltSim.SPACING
+				item["travel"] = minf(limit, float(item["travel"]) + speed)
 
-		# Take one more from the belt feeding the entrance.
-		var behind := world.entity_at(belt.origin - BeltSim.dir_vector(belt.direction))
-		if not BeltSim.is_belt(behind):
-			continue
-		var room := span
-		if not items.is_empty():
-			room = float(items[items.size() - 1]["travel"])
-		if room < BeltSim.SPACING:
-			continue
-		var item := _belt_ready_item(behind)
-		if item.is_empty():
-			continue
-		var taken := BeltSim.take_one(behind)
-		if not taken.is_empty():
-			items.append({"name": str(taken["name"]), "count": int(taken["count"]),
-				"travel": 0.0})
+			# Take one more from the belt feeding the entrance, same lane.
+			if not BeltSim.is_belt(behind):
+				continue
+			var room := span
+			if not queue.is_empty():
+				room = float(queue[queue.size() - 1]["travel"])
+			if room < BeltSim.SPACING:
+				continue
+			var ready := _belt_ready_item(behind, lane)
+			if ready.is_empty():
+				continue
+			var taken := BeltSim.take_one(behind, lane)
+			if not taken.is_empty():
+				queue.append({"name": str(taken["name"]),
+					"count": int(taken["count"]), "travel": 0.0, "lane": lane})
+
+		var flat: Array = []
+		for lane in BeltSim.LANES:
+			flat.append_array(lanes[lane])
+		belt.state["items"] = flat
 
 
 # --------------------------------------------------------------------------

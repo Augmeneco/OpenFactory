@@ -26,6 +26,10 @@ var entities: Dictionary = {}         ## Vector2i -> Entity
 var _entity_owner: Dictionary = {}    ## Vector2i -> Entity (every covered cell)
 var _type_index: Dictionary = {}      ## prototype type -> Array[Entity]
 var _index_dirty := true
+## Entities grouped by the chunk their origin lies in.  The renderer walks only
+## the chunks inside the view instead of testing every tree on the map against
+## the camera rectangle each frame.
+var _chunk_entities: Dictionary = {}  ## Vector2i -> Array[Entity]
 ## Bumped whenever anything the renderer can see changes — a tile, a unit of
 ## ore, an entity.  The renderer keeps its prepared ground rectangles keyed by
 ## this, so it can reuse them instead of rebuilding thousands of cells a frame.
@@ -40,6 +44,13 @@ var _next_cell_stamp := 0
 ## keeps them from rebuilding the whole map.
 var _chunk_stamps: Dictionary = {}
 var _next_chunk_stamp := 0
+## Per-chunk *visual* stamps.  Unlike ``_chunk_stamps`` these change only when
+## the baked picture would look different: a drill removing ore from a tile
+## bumps the ordinary stamp every tick, but the ore artwork only changes when
+## its stage does.  The renderer's cached chunk textures are keyed by this, so
+## mining does not re-rasterise a chunk every frame.
+var _chunk_visual_stamps: Dictionary = {}
+var _next_chunk_visual_stamp := 0
 ## Incremented when the whole map is replaced (new game, load), so caches that
 ## remember one cell's colour can throw everything away even though the
 ## per-cell stamps of the fresh world start at zero again.
@@ -114,6 +125,28 @@ func _bump_chunk(coord: Vector2i) -> void:
 	_chunk_stamps[coord] = _next_chunk_stamp
 
 
+## A number that changes only when a chunk's baked picture would change.
+func chunk_visual_stamp(coord: Vector2i) -> int:
+	return int(_chunk_visual_stamps.get(coord, 0))
+
+
+func _bump_visual_chunk(coord: Vector2i) -> void:
+	_next_chunk_visual_stamp += 1
+	_chunk_visual_stamps[coord] = _next_chunk_visual_stamp
+
+
+func _bump_visual_cell(cell: Vector2i) -> void:
+	_bump_visual_chunk(chunk_of(cell))
+
+
+## Which ore artwork stage an amount corresponds to; -1 means "no ore".
+## Kept here so mining can cheaply tell whether the picture changed.
+func ore_visual_stage(ore_id: int, amount: float) -> int:
+	if ore_id == 0 or amount <= 0.0:
+		return -1
+	return generator.ore_stage(generator.ore_name(ore_id), amount)
+
+
 func tile_name(id: int) -> String:
 	if id < 0 or id >= palette.size():
 		return palette[0] if palette.size() > 0 else ""
@@ -146,6 +179,7 @@ func chunk(coord: Vector2i) -> Chunk:
 	made.generated = true
 	revision += 1
 	_bump_chunk(coord)
+	_bump_visual_chunk(coord)
 	chunk_generated.emit(coord)
 	return made
 
@@ -178,6 +212,7 @@ func set_tile(cell: Vector2i, tile_name_: String) -> void:
 	c.tiles[local_of(cell)] = register_tile(tile_name_)
 	revision += 1
 	_bump_cell(cell)
+	_bump_visual_cell(cell)
 
 
 ## ``{ name = "", amount = 0.0 }`` when the cell carries no ore.
@@ -193,16 +228,21 @@ func ore_at(cell: Vector2i) -> Dictionary:
 func set_ore(cell: Vector2i, ore_name: String, amount: float) -> void:
 	var c := chunk(chunk_of(cell))
 	var idx := local_of(cell)
+	var old_stage := ore_visual_stage(c.ore[idx], c.amount[idx])
 	if ore_name.is_empty() or amount <= 0.0:
 		c.ore[idx] = 0
 		c.amount[idx] = 0.0
 		revision += 1
 		_bump_cell(cell)
+		if old_stage >= 0:
+			_bump_visual_cell(cell)
 		return
 	c.ore[idx] = generator.ore_id(ore_name)
 	c.amount[idx] = amount
 	revision += 1
 	_bump_cell(cell)
+	if ore_visual_stage(c.ore[idx], c.amount[idx]) != old_stage:
+		_bump_visual_cell(cell)
 
 
 func mine_ore(cell: Vector2i, amount: float) -> float:
@@ -210,6 +250,7 @@ func mine_ore(cell: Vector2i, amount: float) -> float:
 	var idx := local_of(cell)
 	if c.ore[idx] == 0:
 		return 0.0
+	var old_stage := ore_visual_stage(c.ore[idx], c.amount[idx])
 	var taken: float = minf(c.amount[idx], amount)
 	c.amount[idx] -= taken
 	if c.amount[idx] <= 0.0:
@@ -217,6 +258,11 @@ func mine_ore(cell: Vector2i, amount: float) -> float:
 		c.amount[idx] = 0.0
 	revision += 1
 	_bump_cell(cell)
+	# A drill draining one patch bumps the ordinary stamp every tick.  The
+	# artwork only changes on a stage boundary, so only then does the baked
+	# chunk need rebuilding.
+	if ore_visual_stage(c.ore[idx], c.amount[idx]) != old_stage:
+		_bump_visual_cell(cell)
 	return taken
 
 
@@ -311,23 +357,41 @@ static func _resource_matches(resource: Dictionary, categories: Array) -> bool:
 
 ## Factorio decides which half of an underground belt you are placing: if
 ## there is already a matching half behind, this one is the exit.
+##
+## The reverse order is supported too.  A player may put the far half down
+## first and the near half afterwards; in that case the new half is the
+## entrance and the existing half ahead is promoted to the exit.  Without
+## this the two halves were both "input" and the tunnel never carried items.
 func orient_underground(entity: Entity) -> void:
 	if entity.proto_type != "underground-belt":
 		return
 	var proto := entity.prototype()
 	var max_distance := int(proto.get("max_distance", 5))
-	var back := posmod(entity.direction + 8, 16)
-	var step := BeltSim.dir_vector(back)
+	var step := BeltSim.dir_vector(entity.direction)
+	# 1. An input behind means this half is the exit.
 	for k in range(1, max_distance + 1):
-		var other := entity_at(entity.origin + step * k)
-		if other == null:
+		var behind := entity_at(entity.origin - step * k)
+		if behind == null:
 			continue
-		if other.proto_type == "underground-belt" and other.name == entity.name \
-				and posmod(other.direction, 16) == posmod(entity.direction, 16) \
-				and str(other.state.get("io", "input")) == "input":
+		if behind.proto_type == "underground-belt" and behind.name == entity.name \
+				and posmod(behind.direction, 16) == posmod(entity.direction, 16) \
+				and str(behind.state.get("io", "input")) == "input":
 			entity.state["io"] = "output"
 			return
+	# 2. Otherwise this is the entrance.  If the exit was placed first, it is
+	#    sitting ahead as an "input"; promote the first matching half.
 	entity.state["io"] = "input"
+	for k in range(1, max_distance + 1):
+		var ahead := entity_at(entity.origin + step * k)
+		if ahead == null:
+			continue
+		if ahead.proto_type != "underground-belt" or ahead.name != entity.name:
+			continue
+		if posmod(ahead.direction, 16) != posmod(entity.direction, 16):
+			continue
+		if str(ahead.state.get("io", "input")) == "input":
+			ahead.state["io"] = "output"
+		break
 
 
 func place_entity(entity: Entity) -> bool:
@@ -345,6 +409,7 @@ func place_entity(entity: Entity) -> bool:
 	for cell in cells:
 		_entity_owner[cell] = entity
 	_index_dirty = true
+	_index_entity(entity)
 	InventoryLayout.attach(entity)
 	# Everything that can be shot starts at its prototype's health.
 	if not entity.state.has("health"):
@@ -426,6 +491,7 @@ func rotate_entity(entity: Entity, new_direction: int) -> bool:
 	for cell: Vector2i in old_cells:
 		if _entity_owner.get(cell) == entity:
 			_entity_owner.erase(cell)
+	_unindex_entity(entity)
 	entities.erase(old_origin)
 	entity.origin = new_origin
 	entity.direction = new_direction_wrapped
@@ -433,6 +499,9 @@ func rotate_entity(entity: Entity, new_direction: int) -> bool:
 	entities[new_origin] = entity
 	for cell: Vector2i in new_cells:
 		_entity_owner[cell] = entity
+	_index_entity(entity)
+	if entity.proto_type == "underground-belt":
+		orient_underground(entity)
 	_index_dirty = true
 	revision += 1
 	return true
@@ -461,11 +530,13 @@ func move_entity(entity: Entity, new_origin: Vector2i) -> bool:
 	for cell: Vector2i in entity.occupied_cells():
 		if _entity_owner.get(cell) == entity:
 			_entity_owner.erase(cell)
+	_unindex_entity(entity)
 	entities.erase(entity.origin)
 	entity.origin = new_origin
 	entities[new_origin] = entity
 	for cell: Vector2i in new_cells:
 		_entity_owner[cell] = entity
+	_index_entity(entity)
 	_index_dirty = true
 	revision += 1
 	return true
@@ -479,6 +550,7 @@ func place_ghost(entity: Entity) -> bool:
 	for cell: Vector2i in entity.occupied_cells():
 		_entity_owner[cell] = entity
 	entities[entity.origin] = entity
+	_index_entity(entity)
 	_index_dirty = true
 	revision += 1
 	entity_placed.emit(entity)
@@ -511,6 +583,7 @@ func ghosts() -> Array:
 
 func remove_entity(entity: Entity) -> void:
 	entities.erase(entity.origin)
+	_unindex_entity(entity)
 	for cell in entity.occupied_cells():
 		if _entity_owner.get(cell) == entity:
 			_entity_owner.erase(cell)
@@ -554,6 +627,31 @@ func entity_count() -> int:
 	return entities.size()
 
 
+## Entities whose origin lies in one chunk.  The renderer uses this to visit
+## only the chunks inside the camera rectangle instead of all 1,500 trees.
+func chunk_entities(coord: Vector2i) -> Array:
+	return _chunk_entities.get(coord, [])
+
+
+func _index_entity(entity: Entity) -> void:
+	var coord := chunk_of(entity.origin)
+	var bucket: Variant = _chunk_entities.get(coord)
+	if bucket == null:
+		bucket = []
+		_chunk_entities[coord] = bucket
+	(bucket as Array).append(entity)
+
+
+func _unindex_entity(entity: Entity) -> void:
+	var coord := chunk_of(entity.origin)
+	var bucket: Variant = _chunk_entities.get(coord)
+	if bucket == null:
+		return
+	(bucket as Array).erase(entity)
+	if (bucket as Array).is_empty():
+		_chunk_entities.erase(coord)
+
+
 func chunk_count() -> int:
 	return _chunks.size()
 
@@ -565,10 +663,12 @@ func clear_all() -> void:
 	entities.clear()
 	_entity_owner.clear()
 	_type_index.clear()
+	_chunk_entities.clear()
 	palette = PackedStringArray()
 	_palette_index.clear()
 	_cell_stamps.clear()
 	_chunk_stamps.clear()
+	_chunk_visual_stamps.clear()
 	epoch += 1
 	_index_dirty = true
 	revision += 1
@@ -580,6 +680,7 @@ func install_chunk(coord: Vector2i, loaded: Chunk) -> void:
 	_chunks[coord] = loaded
 	_cell_stamps.clear()
 	_chunk_stamps.clear()
+	_chunk_visual_stamps.clear()
 	epoch += 1
 	_index_dirty = true
 	revision += 1

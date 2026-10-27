@@ -119,28 +119,76 @@ static func _base_visual(entity: Entity, frame := 0, world: GameWorld = null) ->
 
 		"underground-belt":
 			# An entrance disappears into the ground and an exit rises out of
-			# it, so each half takes a belt-end row rather than a rotation.
+			# it, so each half takes a belt-end row for its belt surface plus
+			# the matching `structure` sprite (the metal housing).  The
+			# structure sheet holds four rotations and an input/output row;
+			# without telling the resolver it has four directions every
+			# orientation would draw the north frame.
 			var uset: Variant = proto.get("belt_animation_set", {})
 			if uset is Dictionary and uset.has("animation_set"):
+				var nodes: Array = [uset["animation_set"]]
+				var flips: Array = [false]
+				var io := str(entity.state.get("io", "input"))
+				var structure: Variant = proto.get("structure", {})
+				if structure is Dictionary:
+					var body: Variant = (structure as Dictionary).get(
+						"direction_out" if io == "output" else "direction_in")
+					if body is Dictionary:
+						body = (body as Dictionary).duplicate(true)
+						var sheet: Variant = (body as Dictionary).get("sheet")
+						if sheet is Dictionary:
+							(sheet as Dictionary)["direction_count"] = 4
+							(sheet as Dictionary)["line_length"] = 4
+						nodes.append(body)
+						# The exit housing is the entrance housing mirrored.
+						# Factorio renders the output with the slope on the
+						# tunnel side and the raised lip facing the outgoing
+						# belt; the raw `direction_out` sheet is the opposite
+						# orientation, so flip it horizontally.
+						flips.append(io == "output")
 				return {
-					"nodes": [uset["animation_set"]],
+					"nodes": nodes,
+					"offsets": [Vector2.ZERO, Vector2.ZERO],
+					"flip_nodes": flips,
 					"direction": underground_shape_row(entity),
 					"is_row": true,
+					"row_nodes": 1,
 				}
 			return {}
 
 		"splitter":
-			# Two belt-wide columns drawn side by side; the shared animation
-			# set is a single-tile sheet, so each half is its own node.
+			# A splitter is a 2x1 body with a belt surface on each half.  The
+			# belt sheet has one tile per node, so the two nodes sit half a
+			# tile either side of the entity centre (the centre is the seam
+			# between the two tiles).  The `structure` and `structure_patch`
+			# sprites are the two metal/gear halves; north/south use one full
+			# body in `structure` and an empty patch, east/west need both.
 			var sset: Variant = proto.get("belt_animation_set", {})
 			if sset is Dictionary and sset.has("animation_set"):
 				var srow := int(BELT_STRAIGHT.get(posmod(direction, 16), 0))
 				var side := lane_offset_vector(entity.direction)
+				var nodes: Array = [sset["animation_set"], sset["animation_set"]]
+				var offsets: Array = [-side * 0.5, side * 0.5]
+				var body: Variant = proto.get("structure", {})
+				if body is Dictionary and not (body as Dictionary).is_empty():
+					body = _direction_animation(body, entity.direction)
+					if body != null:
+						nodes.append(body)
+						offsets.append(Vector2.ZERO)
+				var patch: Variant = proto.get("structure_patch", {})
+				if patch is Dictionary and not (patch as Dictionary).is_empty():
+					patch = _direction_animation(patch, entity.direction)
+					# The empty patch used by north/south is a 1x1 placeholder.
+					if patch is Dictionary and int((patch as Dictionary).get(
+							"width", 0)) > 1:
+						nodes.append(patch)
+						offsets.append(Vector2.ZERO)
 				return {
-					"nodes": [sset["animation_set"], sset["animation_set"]],
-					"offsets": [Vector2.ZERO, side],
+					"nodes": nodes,
+					"offsets": offsets,
 					"direction": srow,
 					"is_row": true,
+					"row_nodes": 2,
 				}
 			return {}
 
@@ -570,14 +618,19 @@ static func lane_offset_vector(direction: int) -> Vector2:
 static func underground_shape_row(entity: Entity) -> int:
 	var facing := posmod(entity.direction, 16)
 	var is_input := str(entity.state.get("io", "input")) == "input"
-	# An entrance is drawn as a belt heading into the tile (its shape faces the
-	# way it travels); an exit as one coming back out.
-	var row := 12 if is_input else 16
+	# Rows 12-19 are four directions, two rows each: the belt surface going
+	# into the tunnel and the open cap coming out of it.  The pairs are
+	# north 12/13, east 14/15, south 16/17, west 18/19.  Using the *next*
+	# direction's row for the exit made an east output draw the west entrance
+	# (inward arrow), which is exactly why an exit looked like an entrance.
+	var row := 12
 	match facing:
-		0: row = 12 if is_input else 16      # north
-		4: row = 14 if is_input else 18      # east
-		8: row = 16 if is_input else 12      # south
-		12: row = 18 if is_input else 14     # west
+		0: row = 12      # north
+		4: row = 14      # east
+		8: row = 16      # south
+		12: row = 18     # west
+	if not is_input:
+		row += 1
 	return row
 
 

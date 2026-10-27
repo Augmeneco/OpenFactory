@@ -57,10 +57,46 @@ var _render_scale := 1.0
 var _map_chunks: MapChunks
 ## Monotonic counter that keeps layers of one entity in their sheet order.
 var _sequence := 0
+## Entities in the current view, shared by the entity/wire/belt passes.
+var _frame_entities: Array = []
+
+## Optional per-frame timing counters, filled by ``_draw`` when enabled.
+## The benchmark (``--bench``) turns this on; normal play leaves it off.
+var profile_enabled := false
+var last_stats: Dictionary = {}
+
+## Ground is rasterised into one texture per chunk and drawn as one rectangle
+## per chunk below this camera scale.  Above it the viewport holds few enough
+## cells that individual tile sprites are cheaper (and sharper at extreme
+## zoom), so the original per-cell path takes over.
+var chunked_ground_threshold := 1.15
+## One-cell border baked around each chunk so ore sprites that overhang their
+## tile are not cut off at a chunk seam.  Only the inner part is drawn.
+const BAKE_MARGIN := 1
+## Upper bound for the baked-texture cache (about 30 chunks at 1024²).
+const BAKE_MAX_BYTES := 160 * 1024 * 1024
+## How long a frame may spend rasterising chunks.  Missing chunks fall back to
+## the minimap-coloured texture until their detailed picture is ready.
+const BAKE_BUDGET_MS := 4.0
+
+var _baked: Dictionary = {}          ## "cx,cy,res" -> {texture, epoch, stamp, res, bytes}
+var _bake_bytes := 0
+var _baked_epoch := -1
+var _bake_show_ore := true
+var _bake_queue: Array = []          ## [{coord, res, epoch}]
+var _bake_pending: Dictionary = {}
+var _bake_job: Dictionary = {}       ## the chunk currently being rasterised
+var _fallback_created := 0
+var _scaled_regions: Dictionary = {} ## source region + target size -> Image
+var _scaled_order: Array = []
+var _water_cells: Dictionary = {}    ## chunk coord -> {epoch, stamp, cells}
+var _fallback_tex: Dictionary = {}   ## chunk coord -> low-res placeholder picture
+var _last_bake_us := 0
 
 
 func _process(delta: float) -> void:
 	_anim_time += delta
+	_pump_bake_queue()
 	queue_redraw()
 
 
@@ -69,7 +105,17 @@ func _process(delta: float) -> void:
 ## A night-vision unit on the engineer stops it, which is the whole of what
 ## that equipment does.
 func _draw() -> void:
-	for item: Dictionary in build_draw_list(visible_world_rect()):
+	var started := Time.get_ticks_usec() if profile_enabled else 0
+	var list := build_draw_list(visible_world_rect())
+	var built := Time.get_ticks_usec() if profile_enabled else 0
+	# Counting texture switches gives a lower bound on the number of canvas
+	# batches the engine can form: consecutive rectangles sharing one texture
+	# may be merged, everything else is a separate draw.
+	var batch_breaks := 0
+	var previous: Texture2D = null
+	var quads := 0
+	var lines := 0
+	for item: Dictionary in list:
 		if item.has("line"):
 			var line: Array = item["line"]
 			var line_colour := Color(float(line[4]), float(line[5]), float(line[6]),
@@ -77,24 +123,46 @@ func _draw() -> void:
 			draw_line(Vector2(float(line[0]), float(line[1])),
 				Vector2(float(line[2]), float(line[3])), line_colour,
 				maxf(1.0, float(item.get("width", 2.0))))
+			lines += 1
+			previous = null
+			batch_breaks += 1
 			continue
 		var texture: Texture2D = item["texture"]
 		if texture == null:
 			continue
+		if texture != previous:
+			batch_breaks += 1
+			previous = texture
+		quads += 1
 		var spin := float(item.get("rotation", 0.0))
-		if is_zero_approx(spin):
+		var flip_h := bool(item.get("flip_h", false))
+		if is_zero_approx(spin) and not flip_h:
 			draw_texture_rect_region(texture, item["dest"], item["src"],
 				item["modulate"])
 			continue
 		# Turned about its pivot (the middle of the rectangle by default, the
 		# inserter base for an arm), then put the transform back so the next
-		# sprite is not affected.
+		# sprite is not affected.  A flipped sprite uses the same pivot with
+		# a negative X scale; this mirrors the underground exit housing.
 		var dest: Rect2 = item["dest"]
 		var pivot: Vector2 = item.get("pivot", dest.get_center())
-		draw_set_transform(pivot, spin, Vector2.ONE)
+		var flip_scale := Vector2(-1.0 if flip_h else 1.0, 1.0)
+		draw_set_transform(pivot, spin, flip_scale)
 		draw_texture_rect_region(texture,
 			Rect2(dest.position - pivot, dest.size), item["src"], item["modulate"])
 		draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	if profile_enabled:
+		var finished := Time.get_ticks_usec()
+		last_stats = {
+			"items": list.size(),
+			"quads": quads,
+			"lines": lines,
+			"batch_breaks": batch_breaks,
+			"build_us": built - started,
+			"submit_us": finished - built,
+			"bake_us": _last_bake_us,
+			"fallbacks": _fallback_created,
+		}
 
 
 ## World-space rectangle currently visible through the canvas transform.
@@ -113,6 +181,7 @@ func visible_world_rect() -> Rect2:
 ## Every textured rectangle that covers ``view``, in painting order.
 func build_draw_list(view: Rect2) -> Array:
 	var out: Array = []
+	_fallback_created = 0
 	_render_scale = _view_scale(view)
 	var min_cell := Vector2i(
 		int(floor(view.position.x / TILE)) - 1,
@@ -121,14 +190,620 @@ func build_draw_list(view: Rect2) -> Array:
 		int(ceil(view.end.x / TILE)) + 1,
 		int(ceil(view.end.y / TILE)) + 1)
 
-	if _render_scale <= ground_lod_threshold:
-		_emit_ground_lod(out, min_cell, max_cell)
+	if _render_scale <= chunked_ground_threshold:
+		_emit_ground_baked(out, min_cell, max_cell)
 	else:
 		_emit_ground(out, min_cell, max_cell)
+		_prewarm_ground(min_cell, max_cell)
 	_emit_entities(out, min_cell, max_cell)
 	if show_grid:
 		_emit_grid(out, min_cell, max_cell)
 	return out
+
+
+# --------------------------------------------------------------------------
+# baked ground
+# --------------------------------------------------------------------------
+#
+# Drawing thousands of 32×32 rectangles every frame is what made zooming out
+# expensive: the scene only held a few thousand cells, but every cell was a
+# separate canvas command and a separate texture switch for the batcher.  The
+# renderer now rasterises each 32×32-tile chunk once into an image (with the
+# real tile and ore sprites, not just map colours) and draws one rectangle per
+# chunk.  A chunk is rebuilt only when its *visual* stamp changes, so a drill
+# draining ore does not repaint the world every tick.
+
+## Pixels per tile used for a baked chunk at this camera scale.  32 is native:
+## one texel per world pixel, exactly what the per-cell path would draw.
+func _bake_resolution(scale: float) -> int:
+	var res := 8
+	if scale >= 0.95:
+		res = 32
+	elif scale >= 0.55:
+		res = 24
+	elif scale >= 0.35:
+		res = 16
+	# The settings slider means "simplify the far view": below the chosen zoom
+	# it drops one quality tier.  A full halving made a newly baked chunk look
+	# much softer than its neighbours, so the step is one tier, not 50%.
+	if scale <= ground_lod_threshold:
+		if res >= 32:
+			res = 24
+		elif res >= 24:
+			res = 16
+		elif res >= 16:
+			res = 12
+	return res
+
+
+## When the camera is close enough for per-cell terrain, quietly prepare the
+## chunks just outside the view at native resolution.  Zooming out then finds a
+## finished texture instead of watching the map colour get replaced chunk by
+## chunk.
+var _prewarm_tick := 0
+
+
+func _prewarm_ground(min_cell: Vector2i, max_cell: Vector2i) -> void:
+	_prewarm_tick += 1
+	if _prewarm_tick % 30 != 0:
+		return
+	var centre := Vector2i((min_cell.x + max_cell.x) / 2,
+		(min_cell.y + max_cell.y) / 2)
+	var coord := GameWorld.chunk_of(centre)
+	for dy in range(-1, 2):
+		for dx in range(-1, 2):
+			_queue_bake(coord + Vector2i(dx, dy), 32)
+
+
+## Decode the terrain and ore sheets before the first bake needs them.
+##
+## A chunk bake is sliced into rows so it cannot freeze a frame, but decoding
+## one of Factorio's large PNG sheets is a single uninterruptible operation.
+## Doing it once during load keeps that cost out of the first zoom or pan; the
+## images would be decoded eventually anyway.
+func preload_ground_images() -> void:
+	if _ground_preloaded_epoch == world.epoch:
+		return
+	_ground_preloaded_epoch = world.epoch
+	var started := Time.get_ticks_usec()
+	var count := 0
+	for tile_name: String in world.palette:
+		var info := TileAtlas.render_info(tile_name)
+		if info.is_empty():
+			continue
+		if FactorioAssets.image(str(info["path"])) != null:
+			count += 1
+	for ore_name: String in Prototypes.all("resource"):
+		var proto := Prototypes.get_p("resource", ore_name)
+		count += _preload_node(proto.get("stages", {}), 0)
+	if count > 0:
+		print("ground art preloaded: %d images, %.1f MB, %.0f ms" % [
+			count, FactorioAssets.resident_bytes / 1048576.0,
+			float(Time.get_ticks_usec() - started) / 1000.0])
+
+
+func _preload_node(node: Variant, depth: int) -> int:
+	if depth > 8:
+		return 0
+	var count := 0
+	if node is Dictionary:
+		var filename := str((node as Dictionary).get("filename", ""))
+		if not filename.is_empty() and FactorioAssets.image(filename) != null:
+			count += 1
+		for key: String in ["layers", "sheets", "sheet"]:
+			if (node as Dictionary).has(key):
+				count += _preload_node((node as Dictionary)[key], depth + 1)
+	elif node is Array:
+		for entry: Variant in node:
+			count += _preload_node(entry, depth + 1)
+	return count
+
+
+## Resolve the artwork of the entities around the engineer during load.
+##
+## The first frame that reveals a machine also decodes its PNG sheet; with a
+## large factory that was a one-off 100 ms hitch the first time a zoom level
+## brought new machines into view.  Warming the common prototypes moves that
+## cost into the loading pause instead of the first pan.
+var _prewarmed: Dictionary = {}
+var _ground_preloaded_epoch := -1
+
+
+func prewarm_entity_visuals(centre: Vector2i, radius_chunks := 2) -> void:
+	var started := Time.get_ticks_usec()
+	var chunk := GameWorld.chunk_of(centre)
+	var count := 0
+	for cy in range(chunk.y - radius_chunks, chunk.y + radius_chunks + 1):
+		for cx in range(chunk.x - radius_chunks, chunk.x + radius_chunks + 1):
+			for entity: Entity in world.chunk_entities(Vector2i(cx, cy)):
+				if _warm_entity(entity):
+					count += 1
+	if count > 0:
+		print("entity art prewarmed: %d entities, %.0f ms" % [
+			count, float(Time.get_ticks_usec() - started) / 1000.0])
+
+
+func _warm_entity(entity: Entity) -> bool:
+	var key := "%s/%s%s" % [entity.proto_type, entity.name,
+		_entity_variant_tag(entity)]
+	if _prewarmed.has(key):
+		return false
+	_prewarmed[key] = true
+	var data := EntityVisuals.visual(entity, 0, world)
+	if data.is_empty():
+		return true
+	var direction := int(data["direction"])
+	var as_row := bool(data.get("is_row", false))
+	var nodes: Array = (data["nodes"] as Array).duplicate()
+	var row_nodes := int(data.get("row_nodes",
+		(data["nodes"] as Array).size() if as_row else 0))
+	if data.has("working_nodes"):
+		nodes.append_array(data["working_nodes"])
+	var node_index := 0
+	for graphics: Variant in nodes:
+		var shape_tag := ""
+		if entity.proto_type == "pipe":
+			shape_tag = "/" + EntityVisuals.pipe_picture_key(world, entity)
+		var tag := _sprite_tag(entity, node_index, shape_tag)
+		var variation := EntityVisuals.variation_for(entity,
+			_variation_count(graphics))
+		var frame := 0
+		if entity.proto_type == "tree":
+			frame = _tree_stage(entity)
+		if as_row and node_index < row_nodes:
+			SpriteCache.layers_row(graphics, direction, frame, variation, tag)
+		else:
+			SpriteCache.layers(graphics, entity.direction, frame, variation, tag)
+		_preload_node(graphics, 0)
+		node_index += 1
+	return true
+
+
+func _emit_ground_baked(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
+	if _baked_epoch != world.epoch or _bake_show_ore != show_ore:
+		# A new game, a loaded save, or the ORE toggle: old chunk pictures no
+		# longer show the right ground.
+		_baked.clear()
+		_bake_bytes = 0
+		_bake_queue.clear()
+		_bake_pending.clear()
+		_bake_job = {}
+		_water_cells.clear()
+		_fallback_tex.clear()
+		_baked_epoch = world.epoch
+		_bake_show_ore = show_ore
+	if _map_chunks == null:
+		_map_chunks = MapChunks.new(world)
+	_map_chunks.require_generated = require_generated_chunks
+	_map_chunks.require_revealed = require_revealed_chunks
+	var res := _bake_resolution(_render_scale)
+	var first := GameWorld.chunk_of(min_cell)
+	var last := GameWorld.chunk_of(max_cell)
+	var water: Array = []
+	var want_water := _render_scale >= 0.50
+	for cy in range(first.y, last.y + 1):
+		for cx in range(first.x, last.x + 1):
+			var coord := Vector2i(cx, cy)
+			if not _chunk_can_be_drawn(coord):
+				continue
+			var entry := _baked_entry(coord, res, false)
+			if entry != null:
+				_push_chunk_quad(out, coord, entry)
+			else:
+				# A bake from another zoom tier is still much better than the
+				# coloured minimap fallback, and it saves rasterising the chunk
+				# again just because the camera moved half a zoom step.
+				var best := _best_baked(coord, res)
+				if best != null:
+					_push_chunk_quad(out, coord, best)
+				else:
+					_queue_bake(coord, res)
+					_push_chunk_fallback(out, coord)
+			if want_water:
+				water.append_array(_water_cells_of(coord))
+	if want_water and not water.is_empty():
+		# A shoreline animates nicely; an ocean would add thousands of quads
+		# and defeat the point of baking the ground, so leave it static.
+		if water.size() <= 1200:
+			_emit_water_cells(out, water)
+
+
+## Whether the map sheet at ``coord`` may be shown at all.  Mirrors
+## ``_chunk_loaded`` but at chunk granularity so a whole chunk is either drawn
+## or skipped.
+func _chunk_can_be_drawn(coord: Vector2i) -> bool:
+	if require_generated_chunks and not world.is_generated(coord):
+		return false
+	if require_revealed_chunks and not world.is_chunk_revealed(coord):
+		return false
+	return true
+
+
+func _bake_key(coord: Vector2i, res: int) -> String:
+	return "%d,%d,%d" % [coord.x, coord.y, res]
+
+
+## The cached texture for one chunk, queuing a bake when it is missing or
+## stale.  A stale texture is returned while the new one is built, so panning
+## never flashes a hole.
+func _baked_entry(coord: Vector2i, res: int, queue_missing := true) -> Variant:
+	var key := _bake_key(coord, res)
+	var entry: Variant = _baked.get(key)
+	var stamp := world.chunk_visual_stamp(coord)
+	if entry != null and int(entry["epoch"]) == world.epoch:
+		entry["used"] = Time.get_ticks_usec()
+		if int(entry["stamp"]) == stamp:
+			return entry
+		if queue_missing:
+			_queue_bake(coord, res)
+		return entry
+	if entry != null:
+		_baked.erase(key)
+	if queue_missing:
+		_queue_bake(coord, res)
+	return null
+
+
+func _best_baked(coord: Vector2i, res: int) -> Variant:
+	# Prefer a sharper picture, then a coarser one; any complete bake beats
+	# the 1-pixel-per-tile map colour.
+	for candidate: int in [32, 24, 16, 12, 8]:
+		if candidate == res:
+			continue
+		var entry: Variant = _baked.get(_bake_key(coord, candidate))
+		if entry != null and int(entry["epoch"]) == world.epoch:
+			entry["used"] = Time.get_ticks_usec()
+			if int(entry["stamp"]) != world.chunk_visual_stamp(coord):
+				_queue_bake(coord, res)
+			return entry
+	return null
+
+
+func _queue_bake(coord: Vector2i, res: int) -> void:
+	var key := _bake_key(coord, res)
+	if _bake_pending.has(key):
+		return
+	if not _chunk_can_be_drawn(coord):
+		return
+	var existing: Variant = _baked.get(key)
+	if existing != null and int(existing["epoch"]) == world.epoch \
+			and int(existing["stamp"]) == world.chunk_visual_stamp(coord):
+		return
+	_bake_pending[key] = true
+	_bake_queue.append({"coord": coord, "res": res, "epoch": world.epoch})
+	# A fast pan can ask for hundreds of chunks.  Keep the newest requests;
+	# chunks that scroll back into view are queued again.
+	while _bake_queue.size() > 256:
+		var dropped: Dictionary = _bake_queue.pop_front()
+		_bake_pending.erase(_bake_key(dropped["coord"], int(dropped["res"])))
+
+
+## Rasterise queued chunks for a few milliseconds per frame.  A chunk bake is
+## split into rows: the first bake of a new zoom tier may have to decode PNGs
+## for several sprite sheets, which used to freeze a whole frame for ~100 ms.
+## Now one row is the smallest unit, so the cost is spread over a handful of
+## frames and the old texture stays on screen until the new one is finished.
+func _pump_bake_queue() -> void:
+	if _bake_job.is_empty() and _bake_queue.is_empty():
+		return
+	var started := Time.get_ticks_usec()
+	var deadline := started + int(BAKE_BUDGET_MS * 1000.0)
+	while true:
+		if not _bake_job.is_empty() and int(_bake_job["epoch"]) != world.epoch:
+			_bake_pending.erase(_bake_job["key"])
+			_bake_job = {}
+		if _bake_job.is_empty():
+			if _bake_queue.is_empty():
+				break
+			var request: Dictionary = _bake_queue.pop_front()
+			var key := _bake_key(request["coord"], int(request["res"]))
+			if int(request["epoch"]) != world.epoch:
+				_bake_pending.erase(key)
+				continue
+			var coord: Vector2i = request["coord"]
+			if not _chunk_can_be_drawn(coord):
+				_bake_pending.erase(key)
+				continue
+			var res := int(request["res"])
+			var stamp := world.chunk_visual_stamp(coord)
+			var existing: Variant = _baked.get(key)
+			if existing != null and int(existing["epoch"]) == world.epoch \
+					and int(existing["stamp"]) == stamp:
+				_bake_pending.erase(key)
+				continue
+			var side := (GameWorld.CHUNK + BAKE_MARGIN * 2) * res
+			var image := Image.create(side, side, false, Image.FORMAT_RGBA8)
+			image.fill(Color(0.055, 0.055, 0.06, 1.0))
+			_bake_job = {
+				"key": key,
+				"coord": coord,
+				"res": res,
+				"epoch": world.epoch,
+				"stamp": stamp,
+				"image": image,
+				"rows": 0,
+				"rows_total": GameWorld.CHUNK + BAKE_MARGIN * 2,
+				"side": side,
+			}
+		var job: Dictionary = _bake_job
+		var res2 := int(job["res"])
+		var rows := int(job["rows"])
+		var rows_total := int(job["rows_total"])
+		var margin := BAKE_MARGIN
+		var base: Vector2i = (job["coord"] as Vector2i) * GameWorld.CHUNK
+		while rows < rows_total and Time.get_ticks_usec() < deadline:
+			var ly := rows - margin
+			for lx in range(-margin, GameWorld.CHUNK + margin):
+				var cell := base + Vector2i(lx, ly)
+				var cell_chunk := GameWorld.chunk_of(cell)
+				if require_generated_chunks and not world.is_generated(cell_chunk):
+					continue
+				_bake_cell(job["image"], cell, Vector2i((lx + margin) * res2,
+					(ly + margin) * res2), res2)
+			rows += 1
+			job["rows"] = rows
+		if rows >= rows_total:
+			var texture := ImageTexture.create_from_image(job["image"])
+			var side := int(job["side"])
+			if int(job["epoch"]) == world.epoch \
+					and int(job["stamp"]) == world.chunk_visual_stamp(job["coord"]):
+				_store_baked(job["coord"], res2, texture, side * side * 4,
+					int(job["stamp"]))
+			_bake_pending.erase(job["key"])
+			_bake_job = {}
+			if Time.get_ticks_usec() >= deadline:
+				break
+			continue
+		break
+	_last_bake_us = Time.get_ticks_usec() - started
+
+
+## Terrain and ore of one cell, composited into the chunk image at ``origin``.
+func _bake_cell(image: Image, cell: Vector2i, origin: Vector2i, res: int) -> void:
+	var info := TileAtlas.render_info(world.tile_at(cell))
+	if not info.is_empty():
+		var rects: Array = info["rects"]
+		var frames: int = info["frames"]
+		var src: Rect2
+		if frames > 1:
+			# Water is baked on its first frame; live water cells are drawn as
+			# a small overlay while zoomed in enough to notice the animation.
+			src = rects[0]
+		else:
+			src = rects[TileAtlas.variant_index(info, cell)]
+		var tile_image := _scaled_region(str(info["path"]), src, res, res)
+		if tile_image != null:
+			image.blit_rect(tile_image, Rect2i(0, 0, res, res), origin)
+	if not show_ore:
+		return
+	var ore := world.ore_at(cell)
+	var ore_name: String = str(ore["name"])
+	if ore_name.is_empty():
+		return
+	var entry := _ore_visual(ore_name)
+	if entry.is_empty():
+		return
+	var variation := SpriteSource.variation_for(cell, int(entry["variations"]))
+	var stage := world.generator.ore_stage(ore_name, ore["amount"])
+	var layers: Array = SpriteCache.layers(entry["stages"], 0, stage, variation,
+		"ore/%s" % ore_name)
+	var scale := float(res) / TILE
+	for layer: SpriteSource.Layer in layers:
+		if layer.light or layer.additive:
+			continue
+		var w := maxi(1, int(round(layer.size.x * scale)))
+		var h := maxi(1, int(round(layer.size.y * scale)))
+		var rel := (layer.offset - layer.size * 0.5 + Vector2(0.5, 0.5) * TILE) \
+			* scale
+		var layer_image := _scaled_region(layer.reference, layer.src_rect,
+			w, h, layer.modulate)
+		if layer_image == null:
+			continue
+		image.blend_rect(layer_image, Rect2i(0, 0, w, h),
+			origin + Vector2i(int(round(rel.x)), int(round(rel.y))))
+
+
+## A source rectangle from a Factorio sheet, resized once and cached.  The
+## cache is what keeps a chunk bake to a few thousand blits instead of a few
+## thousand PNG decodes.
+func _scaled_region(path: String, src: Rect2, w: int, h: int,
+		tint: Color = Color.WHITE) -> Image:
+	if w <= 0 or h <= 0 or path.is_empty():
+		return null
+	var tint_key := "w" if tint == Color.WHITE else tint.to_html()
+	var key := "%s|%d,%d,%d,%d|%dx%d|%s" % [path, int(src.position.x),
+		int(src.position.y), int(src.size.x), int(src.size.y), w, h, tint_key]
+	var cached: Variant = _scaled_regions.get(key)
+	if cached != null:
+		return cached
+	var source := FactorioAssets.image(path)
+	if source == null:
+		_scaled_regions[key] = null
+		_scaled_order.append(key)
+		return null
+	var rect := Rect2i(int(round(src.position.x)), int(round(src.position.y)),
+		int(round(src.size.x)), int(round(src.size.y)))
+	var image_size := source.get_size()
+	if rect.position.x < 0 or rect.position.y < 0 \
+			or rect.position.x + rect.size.x > image_size.x \
+			or rect.position.y + rect.size.y > image_size.y \
+			or rect.size.x <= 0 or rect.size.y <= 0:
+		return null
+	var region := source.get_region(rect)
+	# Blitting and alpha-blending require matching formats; Factorio ships a
+	# mix of RGB and RGBA PNGs, so normalise the slice once here.
+	if region.get_format() != Image.FORMAT_RGBA8:
+		region.convert(Image.FORMAT_RGBA8)
+	if region.get_width() != w or region.get_height() != h:
+		region.resize(w, h, Image.INTERPOLATE_BILINEAR)
+	if tint != Color.WHITE:
+		for y in region.get_height():
+			for x in region.get_width():
+				region.set_pixel(x, y, region.get_pixel(x, y) * tint)
+	_scaled_regions[key] = region
+	_scaled_order.append(key)
+	# Bounded, like every other cache in the renderer.
+	if _scaled_order.size() > 6144:
+		for old: Variant in _scaled_order.slice(0, 512):
+			_scaled_regions.erase(old)
+		_scaled_order = _scaled_order.slice(512)
+	return region
+
+
+func _store_baked(coord: Vector2i, res: int, texture: Texture2D, bytes: int,
+		stamp: int) -> void:
+	var key := _bake_key(coord, res)
+	var existing: Variant = _baked.get(key)
+	if existing != null:
+		_bake_bytes -= int(existing["bytes"])
+		_baked.erase(key)
+	_baked[key] = {
+		"texture": texture,
+		"epoch": world.epoch,
+		"stamp": stamp,
+		"res": res,
+		"bytes": bytes,
+		"used": Time.get_ticks_usec(),
+	}
+	_bake_bytes += bytes
+	# Least-recently-used eviction.  FIFO would throw away a chunk still on
+	# screen just because it was baked before the one the camera panned to.
+	while _bake_bytes > BAKE_MAX_BYTES and _baked.size() > 1:
+		var oldest_key: Variant = ""
+		var oldest_used := 9223372036854775807
+		for candidate: Variant in _baked:
+			var used := int((_baked[candidate] as Dictionary)["used"])
+			if used < oldest_used:
+				oldest_used = used
+				oldest_key = candidate
+		var old_entry: Variant = _baked.get(oldest_key)
+		if old_entry == null:
+			break
+		_bake_bytes -= int(old_entry["bytes"])
+		_baked.erase(oldest_key)
+
+
+func _push_chunk_quad(out: Array, coord: Vector2i, entry: Dictionary) -> void:
+	var res := int(entry["res"])
+	out.append({
+		"texture": entry["texture"],
+		"path": "",
+		"src": Rect2(BAKE_MARGIN * res, BAKE_MARGIN * res,
+			GameWorld.CHUNK * res, GameWorld.CHUNK * res),
+		"dest": Rect2(Vector2(coord * GameWorld.CHUNK) * TILE,
+			Vector2(GameWorld.CHUNK, GameWorld.CHUNK) * TILE),
+		"modulate": Color.WHITE,
+		"sort_y": 0.0,
+	})
+
+
+## Until a chunk has been rasterised, stretch the cheapest map picture over
+## it.  This is only visible for the first frame or two of a zoom change.
+func _push_chunk_fallback(out: Array, coord: Vector2i) -> void:
+	var texture := _fallback_texture(coord)
+	if texture == null:
+		return
+	out.append({
+		"texture": texture,
+		"path": "",
+		"src": Rect2(0, 0, 8, 8),
+		"dest": Rect2(Vector2(coord * GameWorld.CHUNK) * TILE,
+			Vector2(GameWorld.CHUNK, GameWorld.CHUNK) * TILE),
+		"modulate": Color.WHITE,
+		"sort_y": 0.0,
+	})
+
+
+## An 8×8 colour sketch of a chunk, used only for the handful of frames before
+## its detailed bake is ready.  It costs 64 tile lookups instead of the 1024
+## the minimap texture needs, so a zoom-out no longer does seconds of map
+## rasterisation inside one draw.
+func _fallback_texture(coord: Vector2i) -> Texture2D:
+	var stamp := world.chunk_visual_stamp(coord)
+	var cached: Variant = _fallback_tex.get(coord)
+	if cached != null and int(cached["epoch"]) == world.epoch \
+			and int(cached["stamp"]) == stamp:
+		return cached["texture"]
+	const SIDE := 8
+	var image := Image.create(SIDE, SIDE, false, Image.FORMAT_RGBA8)
+	var base := coord * GameWorld.CHUNK
+	var step := GameWorld.CHUNK / SIDE
+	for y in SIDE:
+		for x in SIDE:
+			image.set_pixel(x, y, _map_chunks.colour_at(
+				base + Vector2i(x * step + step / 2, y * step + step / 2),
+				show_ore))
+	var texture := ImageTexture.create_from_image(image)
+	_fallback_created += 1
+	_fallback_tex[coord] = {"epoch": world.epoch, "stamp": stamp,
+		"texture": texture}
+	if _fallback_tex.size() > 512:
+		_fallback_tex.clear()
+		_fallback_tex[coord] = {"epoch": world.epoch, "stamp": stamp,
+			"texture": texture}
+	return texture
+
+
+## Cells in a chunk whose terrain is animated.  Baked chunks hold their first
+## frame, so these are re-emitted live on top when the camera is close enough
+## for the motion to read.
+func _water_cells_of(coord: Vector2i) -> Array:
+	if not world.is_generated(coord):
+		return []
+	var stamp := world.chunk_visual_stamp(coord)
+	var cached: Variant = _water_cells.get(coord)
+	if cached != null and int(cached["epoch"]) == world.epoch \
+			and int(cached["stamp"]) == stamp:
+		return cached["cells"]
+	var animated := _animated_tile_ids()
+	var cells: Array = []
+	var base := coord * GameWorld.CHUNK
+	var chunk := world.chunk(coord)
+	var tiles := chunk.tiles
+	for y in GameWorld.CHUNK:
+		var row := y * GameWorld.CHUNK
+		for x in GameWorld.CHUNK:
+			# Comparing palette ids in the packed chunk array is orders of
+			# magnitude cheaper than calling tile_at/render_info 1024 times.
+			if animated.has(int(tiles[row + x])):
+				cells.append(base + Vector2i(x, y))
+	_water_cells[coord] = {"epoch": world.epoch, "stamp": stamp, "cells": cells}
+	return cells
+
+
+## Palette ids whose terrain is an animation (water waves).
+var _animated_ids: Dictionary = {}
+var _animated_ids_size := -1
+var _animated_ids_epoch := -1
+
+
+func _animated_tile_ids() -> Dictionary:
+	if _animated_ids_size == world.palette.size() \
+			and _animated_ids_epoch == world.epoch:
+		return _animated_ids
+	_animated_ids.clear()
+	for id in world.palette.size():
+		var info := TileAtlas.render_info(world.palette[id])
+		if not info.is_empty() and int(info["frames"]) > 1:
+			_animated_ids[id] = true
+	_animated_ids_size = world.palette.size()
+	_animated_ids_epoch = world.epoch
+	return _animated_ids
+
+
+func _emit_water_cells(out: Array, cells: Array) -> void:
+	var frame := int(_anim_time * WATER_FPS)
+	for cell: Vector2i in cells:
+		var info := TileAtlas.render_info(world.tile_at(cell))
+		if info.is_empty():
+			continue
+		var frames: int = info["frames"]
+		if frames <= 1:
+			continue
+		var rects: Array = info["rects"]
+		_push(out, str(info["path"]), rects[frame % frames],
+			Rect2(float(cell.x) * TILE, float(cell.y) * TILE, TILE, TILE),
+			Color.WHITE, 0.0, info["texture"], 0)
 
 
 # --------------------------------------------------------------------------
@@ -143,34 +818,62 @@ func build_draw_list(view: Rect2) -> Array:
 ## every single frame.  Ground only changes when the world does, or when the
 ## water animation steps, so the prepared lists are kept and reused.
 var _cell_cache: Dictionary = {}
-var _cell_cache_revision := -1
+var _cell_cache_epoch := -1
 var _cell_cache_water_frame := -1
 var _cell_cache_show_ore := true
+## chunk coord -> visual stamp the cached cells were built from.
+var _cell_cache_stamps: Dictionary = {}
+## Cells whose terrain is animated; only these need a rebuild when the water
+## frame advances.  Without this the whole visible ground was thrown away six
+## times a second.
+var _animated_cells: Dictionary = {}
 
 
 func _emit_ground(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
-	var water_frame := int(_anim_time * WATER_FPS)
-	if _cell_cache_revision != world.revision \
-			or _cell_cache_water_frame != water_frame \
-			or _cell_cache_show_ore != show_ore:
+	if _cell_cache_epoch != world.epoch or _cell_cache_show_ore != show_ore:
 		_cell_cache.clear()
-		_cell_cache_revision = world.revision
-		_cell_cache_water_frame = water_frame
+		_cell_cache_stamps.clear()
+		_animated_cells.clear()
+		_cell_cache_epoch = world.epoch
 		_cell_cache_show_ore = show_ore
+	var water_frame := int(_anim_time * WATER_FPS)
+	if _cell_cache_water_frame != water_frame:
+		for cell: Vector2i in _animated_cells:
+			_cell_cache.erase(cell)
+		_cell_cache_water_frame = water_frame
 	# A long journey would otherwise keep every cell ever seen alive.
 	if _cell_cache.size() > 60000:
 		_cell_cache.clear()
+		_cell_cache_stamps.clear()
+	var last_chunk := Vector2i(2147483647, 2147483647)
 	for cy in range(min_cell.y, max_cell.y + 1):
 		for cx in range(min_cell.x, max_cell.x + 1):
 			var cell := Vector2i(cx, cy)
 			if not _chunk_loaded(cell):
 				continue
+			var coord := GameWorld.chunk_of(cell)
+			if coord != last_chunk:
+				last_chunk = coord
+				var stamp := world.chunk_visual_stamp(coord)
+				if int(_cell_cache_stamps.get(coord, -1)) != stamp:
+					_invalidate_chunk_cells(coord)
+					_cell_cache_stamps[coord] = stamp
 			var cached: Variant = _cell_cache.get(cell)
 			if cached == null:
 				cached = _build_cell(cell)
 				_cell_cache[cell] = cached
 			if not (cached as Array).is_empty():
 				out.append_array(cached)
+
+
+## Drop the cached rectangles of one chunk after its ground artwork changed.
+func _invalidate_chunk_cells(coord: Vector2i) -> void:
+	if not _cell_cache_stamps.has(coord):
+		return
+	var base := coord * GameWorld.CHUNK
+	for y in GameWorld.CHUNK:
+		for x in GameWorld.CHUNK:
+			_cell_cache.erase(base + Vector2i(x, y))
 
 
 ## Viewport pixels per world pixel, clamped so a detached preview still works.
@@ -181,33 +884,6 @@ func _view_scale(view: Rect2) -> float:
 	if viewport_width <= 0.0:
 		return 1.0
 	return clampf(viewport_width / view.size.x, 0.01, 8.0)
-
-
-## Zoomed-out ground: one cached 32x32 coloured chunk texture per chunk.
-## Ungenerated chunks are left dark rather than generating hundreds of them
-## inside a single frame.
-func _emit_ground_lod(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
-	if _map_chunks == null:
-		_map_chunks = MapChunks.new(world)
-	_map_chunks.require_generated = require_generated_chunks
-	_map_chunks.require_revealed = require_revealed_chunks
-	var first := GameWorld.chunk_of(min_cell)
-	var last := GameWorld.chunk_of(max_cell)
-	for cy in range(first.y, last.y + 1):
-		for cx in range(first.x, last.x + 1):
-			var coord := Vector2i(cx, cy)
-			var texture := _map_chunks.texture_for(coord, false, true)
-			if texture == null:
-				continue
-			out.append({
-				"texture": texture,
-				"path": "",
-				"src": Rect2(0, 0, GameWorld.CHUNK, GameWorld.CHUNK),
-				"dest": Rect2(Vector2(coord * GameWorld.CHUNK) * TILE,
-					Vector2(GameWorld.CHUNK, GameWorld.CHUNK) * TILE),
-				"modulate": Color.WHITE,
-				"sort_y": 0.0,
-			})
 
 
 ## The terrain (and ore) rectangles standing on one cell.
@@ -221,11 +897,12 @@ func _build_cell(cell: Vector2i) -> Array:
 		var src: Rect2
 		if frames > 1:
 			src = rects[int(_anim_time * WATER_FPS) % frames]
+			_animated_cells[cell] = true
 		else:
 			src = rects[TileAtlas.variant_index(info, cell)]
 		_push(out, info["path"], src,
 			Rect2(float(cell.x) * TILE, float(cell.y) * TILE, TILE, TILE),
-			Color.WHITE, 0.0, info["texture"])
+			Color.WHITE, 0.0, info["texture"], 0)
 	if not show_ore:
 		return out
 	var ore := world.ore_at(cell)
@@ -247,7 +924,7 @@ func _build_cell(cell: Vector2i) -> Array:
 	for layer: SpriteSource.Layer in layers:
 		_push(out, layer.reference, layer.src_rect,
 			Rect2(centre + layer.offset - layer.size * 0.5, layer.size),
-			layer.modulate)
+			layer.modulate, 0.0, null, 1)
 	return out
 
 
@@ -273,15 +950,18 @@ func _ore_visual(ore_name: String) -> Dictionary:
 
 func _push(out: Array, path: String, src: Rect2, dest: Rect2,
 		modulate: Color = Color.WHITE, sort_y := 0.0,
-		texture_override: Texture2D = null) -> void:
-	out.append({
+		texture_override: Texture2D = null, ground_layer := -1) -> void:
+	var item := {
 		"texture": texture_override if texture_override != null else FactorioAssets.texture(path),
 		"path": path,
 		"src": src,
 		"dest": dest,
 		"modulate": modulate,
 		"sort_y": sort_y,
-	})
+	}
+	if ground_layer >= 0:
+		item["ground_layer"] = ground_layer
+	out.append(item)
 
 
 # --------------------------------------------------------------------------
@@ -310,25 +990,46 @@ func _chunk_loaded(cell: Vector2i) -> bool:
 	return true
 
 
+## Every entity whose origin chunk is in or next to the view.  A one-chunk
+## margin keeps large multi-tile machines that start just outside the rectangle
+## visible when their sprite reaches into it.
+func _entities_in_view(min_cell: Vector2i, max_cell: Vector2i) -> Array:
+	if world == null:
+		return []
+	var first := GameWorld.chunk_of(min_cell) - Vector2i.ONE
+	var last := GameWorld.chunk_of(max_cell) + Vector2i.ONE
+	var out: Array = []
+	for cy in range(first.y, last.y + 1):
+		for cx in range(first.x, last.x + 1):
+			out.append_array(world.chunk_entities(Vector2i(cx, cy)))
+	return out
+
+
+## Entity list shared by the entity/wire/belt passes of one draw.  Cached for
+## the frame so the view is not rebuilt three times.
 func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 	var shadows: Array = []
 	var bodies: Array = []
 	var badges: Array = []
 	_sequence = 0
+	_frame_entities = _entities_in_view(min_cell, max_cell)
 
-	for entity: Entity in world.entities.values():
-		if not _chunk_loaded(entity.origin):
-			continue
-		if entity.origin.x + entity.size.x < min_cell.x or entity.origin.x > max_cell.x:
-			continue
-		if entity.origin.y + entity.size.y < min_cell.y or entity.origin.y > max_cell.y:
-			continue
+	for entity: Entity in _frame_entities:
+		# Cull by zoom before touching the chunk map.  Trees and rocks are the
+		# overwhelming majority of the entity table, and at low zoom they are
+		# invisible anyway.
 		if _render_scale < 0.65 and entity.proto_type in [
 				"tree", "simple-entity", "item-entity"]:
 			continue
 		if _render_scale < 0.22 and entity.proto_type in [
 				"inserter", "electric-pole", "big-electric-pole", "substation",
 				"pipe", "pipe-to-ground", "wall", "gate", "item-entity"]:
+			continue
+		if not _chunk_loaded(entity.origin):
+			continue
+		if entity.origin.x + entity.size.x < min_cell.x or entity.origin.x > max_cell.x:
+			continue
+		if entity.origin.y + entity.size.y < min_cell.y or entity.origin.y > max_cell.y:
 			continue
 		var center := entity.center() * TILE
 		if entity.proto_type == "item-entity":
@@ -359,20 +1060,15 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 		var any := false
 		var as_row := bool(visual_data.get("is_row", false))
 		var node_offsets: Array = visual_data.get("offsets", [])
+		var node_flips: Array = visual_data.get("flip_nodes", [])
 		var node_index := 0
 		var nodes: Array = visual_data["nodes"]
+		var row_nodes := int(visual_data.get("row_nodes",
+			nodes.size() if as_row else 0))
 		if visual_data.has("working_nodes") and _machine_is_working(entity):
 			nodes = nodes.duplicate()
 			nodes.append_array(visual_data["working_nodes"])
 		for graphics: Variant in nodes:
-			# The visual may have already resolved a direction table and
-			# returned direction 0 (drills do this).  The tag must include the
-			# entity's facing or the first orientation's sprite stays cached
-			# for every rotation.
-			# Include the tile: variation is chosen per entity in
-			# EntityVisuals, so two rocks with the same prototype must not
-			# share one cached variant (the first rock otherwise painted all
-			# the others and appeared to change when the cache was rebuilt).
 			# Pipes select one of eighteen connection pictures from their
 			# neighbours.  The picture is part of the cache identity; without
 			# it a pipe could keep the sprite it had before a neighbouring
@@ -381,24 +1077,32 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 			var shape_tag := ""
 			if entity.proto_type == "pipe":
 				shape_tag = "/" + EntityVisuals.pipe_picture_key(world, entity)
-			var tag := "%s/%s/d%d/o%d_%d%s#%d" % [entity.proto_type,
-				entity.name, posmod(entity.direction, 16), entity.origin.x,
-				entity.origin.y, shape_tag, node_index]
+			# The tile used to be part of the tag, which gave every tree on the
+			# map its own cache entry and made the first frame that revealed a
+			# forest resolve hundreds of identical sprite sheets again.  The
+			# tag now identifies the prototype, facing, chosen variant and
+			# graphics node; frame/direction stay in the cache key.
+			var tag := _sprite_tag(entity, node_index, shape_tag)
 			# A multi-tile entity such as a splitter draws one node per tile.
 			var tile_shift := Vector2.ZERO
 			if node_index < node_offsets.size():
 				tile_shift = Vector2(node_offsets[node_index]) * TILE
 			node_index += 1
+			var flipped := node_index - 1 < node_flips.size() \
+				and bool(node_flips[node_index - 1])
 			var variation := EntityVisuals.variation_for(entity, _variation_count(graphics))
+			var use_row := as_row and node_index - 1 < row_nodes
 			# Belts scroll their sheet; the frame is derived from the belt's
 			# own speed so yellow, red and blue belts do not animate alike.
-			var frame := _belt_animation_frame(entity, graphics) if as_row \
+			# A splitter's metal body is not a belt row: it uses the entity's
+			# facing and the generic machine animation clock.
+			var frame := _belt_animation_frame(entity, graphics) if use_row \
 				else _entity_animation_frame()
 			if visual_data.has("frame"):
 				frame = int(visual_data["frame"])
 			var layers: Array = SpriteCache.layers_row(graphics, direction, frame,
-				variation, tag) if as_row else SpriteCache.layers(graphics,
-				direction, frame, variation, tag)
+				variation, tag) if use_row else SpriteCache.layers(graphics,
+				entity.direction, frame, variation, tag)
 			for layer: SpriteSource.Layer in layers:
 				# These are additive light masks: the batched canvas cannot
 				# blend them, and drawing one normally paints an opaque black
@@ -427,6 +1131,7 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 					"dest": dest,
 					"modulate": modulate,
 					"rotation": spin + layer.rotation,
+					"flip_h": flipped,
 					"sort_y": center.y,
 					"seq": _sequence,
 				}
@@ -463,6 +1168,55 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 	out.append_array(bodies)
 	# Badges are UI-ish and stay above every world object.
 	out.append_array(badges)
+
+
+## Cache identity of one graphics node of an entity.  Shared by the draw loop
+## and the load-time prewarm so both fill the same entries.
+func _sprite_tag(entity: Entity, node_index: int, shape_tag: String) -> String:
+	# The facing stays in the tag: several prototypes resolve a direction table
+	# in EntityVisuals and report direction 0, so the cache key alone cannot
+	# tell a north-facing drill from an east-facing one.  An underground belt
+	# also needs its input/output state: the housing changes art but shares the
+	# direction with the other half.
+	var state_tag := ""
+	if entity.proto_type == "underground-belt":
+		state_tag = "/" + str(entity.state.get("io", "input"))
+	return "%s/%s/d%d%s%s%s#%d" % [entity.proto_type, entity.name,
+		posmod(entity.direction, 16), _entity_variant_tag(entity),
+		shape_tag, state_tag, node_index]
+
+
+## Artwork that is chosen per entity rather than by the shared direction /
+## frame / variation cache key.  Trees and rocks pick a variant by position,
+## spawners do the same, and a combinator's second node is the symbol for its
+## configured operation.  Including that selection in the cache tag lets every
+## other entity of the same prototype share one resolved sprite list.
+func _entity_variant_tag(entity: Entity) -> String:
+	match entity.proto_type:
+		"tree":
+			var proto := entity.prototype()
+			var list: Variant = proto.get("variations", [])
+			if not (list is Array) or (list as Array).is_empty():
+				list = proto.get("pictures", [])
+			if list is Array and not (list as Array).is_empty():
+				return "/v%d" % SpriteSource.variation_for(entity.origin,
+					(list as Array).size())
+		"simple-entity":
+			var pictures: Variant = entity.prototype().get("pictures", [])
+			if pictures is Array and not (pictures as Array).is_empty():
+				return "/v%d" % SpriteSource.variation_for(entity.origin,
+					(pictures as Array).size())
+		"unit-spawner":
+			var graphics: Variant = entity.prototype().get("graphics_set", {})
+			if graphics is Dictionary:
+				var animations: Variant = (graphics as Dictionary).get(
+					"animations", [])
+				if animations is Array and not (animations as Array).is_empty():
+					return "/v%d" % SpriteSource.variation_for(entity.origin,
+						(animations as Array).size())
+		"constant-combinator", "arithmetic-combinator", "decider-combinator":
+			return "/o%d_%d" % [entity.origin.x, entity.origin.y]
+	return ""
 
 
 ## A stack of items lying on the ground, produced by a mining drill or dropped
@@ -577,10 +1331,16 @@ func _pole_top(entity: Entity) -> Vector2:
 func _emit_wires(bodies: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 	if simulation == null or simulation.circuits == null:
 		return
-	for entity: Entity in world.entities.values():
+	for entity: Entity in _frame_entities:
 		if entity.is_ghost():
 			continue
-		for wire: Variant in CircuitNetwork.wires_of(entity):
+		# Most entities have no circuit connection at all.  Checking the state
+		# directly avoids `wires_of` creating an empty array on every tree in
+		# the world (which also bloated the save).
+		var raw_wires: Variant = entity.state.get("wires")
+		if not (raw_wires is Array) or (raw_wires as Array).is_empty():
+			continue
+		for wire: Variant in raw_wires:
 			if not (wire is Dictionary):
 				continue
 			var entry: Dictionary = wire
@@ -626,7 +1386,7 @@ func _emit_alt_badges(badges: Array, min_cell: Vector2i,
 	const BADGE := 22.0
 	const HALO := 52.0
 	var halo := _alt_backdrop_texture()
-	for entity: Entity in world.entities.values():
+	for entity: Entity in _frame_entities:
 		if not _chunk_loaded(entity.origin):
 			continue
 		if entity.origin.x < min_cell.x or entity.origin.x > max_cell.x \
@@ -1007,10 +1767,15 @@ func _emit_character(shadows: Array, bodies: Array) -> void:
 
 ## Items riding on belts, drawn as their inventory icons.
 func _emit_belt_items(bodies: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
-	if _render_scale < 0.25:
+	# Items on belts are 11 px icons: below this zoom they are sub-pixel and
+	# only add work.
+	if _render_scale < 0.32:
 		return
-	for belt: Entity in world.entities.values():
-		if not BeltSim.is_belt(belt) or not _chunk_loaded(belt.origin):
+	# Only plain belts own lane/position items.  An underground entrance keeps
+	# tunnel items with a `travel` distance instead (they are hidden while
+	# underground), and a splitter pulls from the belts in front of it.
+	for belt: Entity in world.entities_of_type("transport-belt"):
+		if not _chunk_loaded(belt.origin):
 			continue
 		if belt.origin.x < min_cell.x - 1 or belt.origin.x > max_cell.x + 1:
 			continue

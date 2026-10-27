@@ -165,6 +165,9 @@ static func _accept(belt: Entity, item: Dictionary, lane: int, position: float) 
 static func lane_rear(belt: Entity, lane: int) -> float:
 	var rear := INF
 	for item: Dictionary in items_of(belt):
+		# Underground tunnel items are not lane items.
+		if not item.has("lane") or not item.has("pos"):
+			continue
 		if int(item["lane"]) == lane:
 			rear = minf(rear, float(item["pos"]))
 	return rear
@@ -178,16 +181,20 @@ static func lane_has_space(belt: Entity, lane: int) -> bool:
 ## Put items onto the belt at its rear.  Returns the amount that fit.
 ##
 ## The preferred lane is used when it has room; otherwise the other lane is
-## tried, so an inserter is never deadlocked by a single full lane.
+## tried, so an inserter is never deadlocked by a single full lane.  Pass
+## ``allow_other_lane = false`` for a splitter: an item must stay in the lane
+## it was travelling in.
 static func try_insert(belt: Entity, item_name: String, amount: int,
-		preferred_lane := -1) -> int:
+		preferred_lane := -1, allow_other_lane := true) -> int:
 	if amount <= 0:
 		return 0
 	var items := items_of(belt)
 
 	var order: Array = []
 	if preferred_lane >= 0 and preferred_lane < LANES:
-		order = [preferred_lane, 1 - preferred_lane]
+		order = [preferred_lane]
+		if allow_other_lane:
+			order.append(1 - preferred_lane)
 	else:
 		order = [0, 1]
 		# Prefer whichever lane has the most room at its rear.
@@ -207,6 +214,8 @@ static func take_one(belt: Entity, preferred_lane := -1) -> Dictionary:
 	var items := items_of(belt)
 	var best: Variant = null
 	for item: Dictionary in items:
+		if not item.has("lane") or not item.has("pos"):
+			continue
 		if preferred_lane >= 0 and int(item["lane"]) != preferred_lane:
 			continue
 		if best == null or float(item["pos"]) > float(best["pos"]):
@@ -222,6 +231,8 @@ static func peek_one(belt: Entity, preferred_lane := -1) -> Dictionary:
 	var items := items_of(belt)
 	var best: Variant = null
 	for item: Dictionary in items:
+		if not item.has("lane") or not item.has("pos"):
+			continue
 		if preferred_lane >= 0 and int(item["lane"]) != preferred_lane:
 			continue
 		if best == null or float(item["pos"]) > float(best["pos"]):

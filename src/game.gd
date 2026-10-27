@@ -60,6 +60,12 @@ var _cursor_count: Label
 ## Frame counter for the throttled, purely cosmetic HUD work.
 var _slow_frame := 0
 
+## Touch/mobile controls are created only on a touch device (or with --touch,
+## which makes desktop layout testing possible).
+var touch_mode := false
+var touch_controls: TouchControls
+var _force_touch := false
+
 var _screenshot_path := ""
 var _screenshot_after := 25
 var _frame_counter := 0
@@ -99,9 +105,19 @@ var _after_ticks := 0
 var _tick_accumulator := 0.0
 var _hud_frame := 0
 
+## ``--bench`` measures frame time at a series of camera zooms and prints one
+## machine-readable line per zoom.  It is a development tool, not a game mode.
+var _bench := false
+var _bench_seconds := 2.0
+var _bench_lod := -1.0
+var _bench_zooms: Array = [2.7, 1.5, 1.0, 0.86, 0.7, 0.61, 0.5, 0.35, 0.25]
+
 
 func _ready() -> void:
 	_parse_args()
+	touch_mode = _force_touch or OS.has_feature("mobile") \
+		or DisplayServer.is_touchscreen_available()
+	UiKit.touch_mode = touch_mode
 	randomize()
 	if _seed == 0:
 		_seed = randi()
@@ -191,11 +207,24 @@ func _ready() -> void:
 	for i in _after_ticks:
 		sim.step()
 
+	# Decode terrain/ore sheets up front so the first chunk bake during play
+	# does not have to.
+	_preload_visuals()
+
+	# A screenshot dump may ask for a particular zoom (used to compare the
+	# per-cell and baked-terrain paths from the command line).
+	if not _screenshot_path.is_empty() and not is_equal_approx(_dump_zoom, 1.0):
+		camera.set_zoom_level(_dump_zoom)
+
 	# The title screen, unless a command line asked for something specific.
 	if _action.is_empty() and _dump_path.is_empty() and not _dump_ui \
 			and not _report and _minimap_png.is_empty() and _showroom.is_empty() \
-			and not _enemy_demo:
+			and not _enemy_demo and not _bench:
 		_show_main_menu()
+
+	if _bench:
+		_run_benchmark.call_deferred()
+		return
 
 	if not _minimap_png.is_empty() and minimap != null:
 		minimap.follow(_spawn_cell)
@@ -264,6 +293,8 @@ func _parse_args() -> void:
 				_set_start_time = true
 			"--alt":
 				_start_with_alt = true
+			"--touch":
+				_force_touch = true
 			"--enemy-demo":
 				_enemy_demo = true
 			"--minimap-png":
@@ -284,7 +315,161 @@ func _parse_args() -> void:
 				i += 1
 				if i < args.size():
 					_dump_ui_screen = args[i]
+			"--bench":
+				_bench = true
+			"--bench-seconds":
+				i += 1
+				if i < args.size():
+					_bench_seconds = maxf(0.25, float(args[i]))
+			"--bench-lod":
+				i += 1
+				if i < args.size():
+					_bench_lod = clampf(float(args[i]), 0.0, 1.0)
 		i += 1
+
+
+## Frame-time probe used while tuning the renderer.
+##
+## Vsync is turned off so the numbers are CPU/GPU cost rather than the display
+## refresh, and the camera is stepped through the zoom range at a fixed
+## position.  One line per zoom is printed; the same rows are written to
+## ``res://tmp_preview/bench.json`` for the report.
+func _run_benchmark() -> void:
+	if DisplayServer.get_name() != "headless":
+		DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	Engine.max_fps = 0
+	if main_menu != null:
+		main_menu.close_menu()
+	if pause_menu != null:
+		pause_menu.visible = false
+	if renderer == null:
+		get_tree().quit(1)
+		return
+	renderer.profile_enabled = true
+	if _bench_lod >= 0.0:
+		renderer.ground_lod_threshold = _bench_lod
+	# Keep the view on the engineer: the numbers are meaningless if the camera
+	# drifts into ungenerated chunks between rows.
+	camera.follow_target = Vector2.INF
+	camera.position = character.world_position()
+	# Let chunk loading and the first frame settle before measuring.
+	await _bench_wait(1.0)
+	var rows: Array = []
+	for zoom: float in _bench_zooms:
+		camera.set_zoom_level(zoom)
+		# Measure the frames immediately after the zoom change as well: this is
+		# where a new bake tier starts filling in.
+		var transition := await _bench_measure(0.6)
+		var row := await _bench_measure(_bench_seconds)
+		row["transition_max_ms"] = transition["frame_max_ms"]
+		row["transition_bake_ms"] = transition["bake_max_ms"]
+		row["transition_build_max_ms"] = transition["build_max_ms"]
+		row["transition_fallbacks"] = transition["fallbacks"]
+		row["zoom"] = zoom
+		row["lod_threshold"] = renderer.ground_lod_threshold
+		rows.append(row)
+		print("BENCH z=%.2f fps=%.1f frame_ms=%.2f frame_max_ms=%.2f transition_max_ms=%.2f transition_build_max_ms=%.2f transition_fallbacks=%d build_ms=%.2f submit_ms=%.2f bake_ms=%.2f bake_max_ms=%.2f items=%d quads=%d lines=%d batches=%d draw_calls=%d prims=%d process_ms=%.2f" % [
+			zoom, row["fps"], row["frame_ms"], row["frame_max_ms"],
+			row["transition_max_ms"], row["transition_build_max_ms"],
+			row["transition_fallbacks"], row["build_ms"], row["submit_ms"],
+			row["bake_ms"], row["bake_max_ms"], row["items"], row["quads"],
+			row["lines"], row["batches"], row["draw_calls"],
+			row["primitives"], row["process_ms"]])
+	# The simulation cost alone, with no world drawing, so the report can say
+	# how much of the frame is renderer and how much is factory logic.
+	camera.set_zoom_level(1.0)
+	renderer.visible = false
+	await _bench_wait(0.5)
+	var sim_only := await _bench_measure(_bench_seconds)
+	renderer.visible = true
+	print("BENCH sim_only fps=%.1f frame_ms=%.2f process_ms=%.2f" % [
+		sim_only["fps"], sim_only["frame_ms"], sim_only["process_ms"]])
+	var payload := {
+		"entities": world.entities.size(),
+		"chunks": world.chunk_count(),
+		"viewport": get_viewport_rect().size,
+		"rows": rows,
+		"sim_only": sim_only,
+	}
+	var file := FileAccess.open("res://tmp_preview/bench.json", FileAccess.WRITE)
+	if file != null:
+		file.store_string(JSON.stringify(payload, "\t"))
+		file.close()
+	get_tree().quit(0)
+
+
+func _bench_wait(seconds: float) -> void:
+	var deadline := Time.get_ticks_usec() + int(seconds * 1000000.0)
+	while Time.get_ticks_usec() < deadline:
+		await Engine.get_main_loop().process_frame
+
+
+func _bench_measure(seconds: float) -> Dictionary:
+	var start := Time.get_ticks_usec()
+	var previous := start
+	var deadline := start + int(seconds * 1000000.0)
+	var frames := 0
+	var frame_us := 0
+	var max_frame_us := 0
+	var build_us := 0
+	var max_build_us := 0
+	var submit_us := 0
+	var bake_us := 0
+	var max_bake_us := 0
+	var fallbacks := 0
+	var max_fallbacks := 0
+	var items := 0
+	var quads := 0
+	var lines := 0
+	var batches := 0
+	while Time.get_ticks_usec() < deadline:
+		await Engine.get_main_loop().process_frame
+		var now := Time.get_ticks_usec()
+		var elapsed := now - previous
+		frame_us += elapsed
+		max_frame_us = maxi(max_frame_us, elapsed)
+		previous = now
+		frames += 1
+		var stats: Dictionary = renderer.last_stats
+		if not stats.is_empty():
+			var frame_build := int(stats["build_us"])
+			build_us += frame_build
+			max_build_us = maxi(max_build_us, frame_build)
+			submit_us += int(stats["submit_us"])
+			bake_us += int(stats.get("bake_us", 0))
+			max_bake_us = maxi(max_bake_us, int(stats.get("bake_us", 0)))
+			var frame_fallbacks := int(stats.get("fallbacks", 0))
+			fallbacks += frame_fallbacks
+			max_fallbacks = maxi(max_fallbacks, frame_fallbacks)
+			items += int(stats["items"])
+			quads += int(stats["quads"])
+			lines += int(stats["lines"])
+			batches += int(stats["batch_breaks"])
+	frames = maxi(frames, 1)
+	var drawn := maxi(frames, 1)
+	var draw_calls := Performance.get_monitor(
+		Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME)
+	var primitives := Performance.get_monitor(
+		Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME)
+	return {
+		"fps": 1000000.0 * float(frames) / maxf(1.0, float(frame_us)),
+		"frame_ms": float(frame_us) / float(frames) / 1000.0,
+		"frame_max_ms": float(max_frame_us) / 1000.0,
+		"build_ms": float(build_us) / float(drawn) / 1000.0,
+		"build_max_ms": float(max_build_us) / 1000.0,
+		"submit_ms": float(submit_us) / float(drawn) / 1000.0,
+		"bake_ms": float(bake_us) / float(drawn) / 1000.0,
+		"bake_max_ms": float(max_bake_us) / 1000.0,
+		"fallbacks": max_fallbacks,
+		"items": int(float(items) / float(drawn)),
+		"quads": int(float(quads) / float(drawn)),
+		"lines": int(float(lines) / float(drawn)),
+		"batches": int(float(batches) / float(drawn)),
+		"draw_calls": draw_calls,
+		"primitives": primitives,
+		"process_ms": Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0,
+		"nodes": Performance.get_monitor(Performance.OBJECT_NODE_COUNT),
+	}
 
 
 ## Human-readable snapshot of every entity, for headless debugging.
@@ -483,11 +668,18 @@ func _process(delta: float) -> void:
 	if player != null:
 		player.set_hud_visible(not title_screen)
 	if toolbar != null:
-		toolbar.visible = not title_screen
+		toolbar.visible = not title_screen and not touch_mode
 	if objective_panel != null:
 		objective_panel.visible = not title_screen and tutorial_enabled
 	if weapon_panel != null:
-		weapon_panel.visible = not title_screen
+		weapon_panel.visible = not title_screen and not touch_mode
+	if touch_controls != null:
+		var show_touch := touch_mode and not title_screen and not ui_is_open()
+		touch_controls.visible = show_touch
+		if not show_touch:
+			touch_controls.reset()
+			if player != null:
+				player.touch_move = Vector2.ZERO
 	if recenter_button != null:
 		var detached := camera != null and not camera.follow_target.is_finite()
 		recenter_button.visible = not title_screen and detached
@@ -583,6 +775,10 @@ func _build_starter_factory() -> void:
 ## it, so the picture shows exactly which sprite the neighbour rule picks.
 func _build_belt_showroom() -> void:
 	var origin := _free_cell_near(Vector2i(0, 0))
+	# This is a test rig: guarantee dry land under the whole layout.  Without
+	# it a nearby lake silently refused the splitter and underground halves,
+	# which made the showroom useless for checking those entities.
+	_flatten_showroom(origin + Vector2i(-3, -4), Vector2i(38, 22))
 	var cases := [
 		{"heading": 0, "from": 4},    # north, fed from the east
 		{"heading": 0, "from": 12},   # north, fed from the west
@@ -604,22 +800,37 @@ func _build_belt_showroom() -> void:
 			posmod(from + 8, 16))
 		_place("transport-belt", "transport-belt", base + BeltSim.dir_vector(heading),
 			heading)
-	# A splitter with both of its outputs, and an underground pair.
+	# A splitter with two inputs and both outputs, plus an underground pair.
 	var split_base := origin + Vector2i(2, 12)
 	_place("transport-belt", "transport-belt", split_base + Vector2i(-1, 0), 4)
+	_place("transport-belt", "transport-belt", split_base + Vector2i(-1, 1), 4)
 	_place("splitter", "splitter", split_base, 4)
 	_place("transport-belt", "transport-belt", split_base + Vector2i(1, 0), 4)
 	_place("transport-belt", "transport-belt", split_base + Vector2i(1, 1), 4)
+	for dy in 2:
+		var input := world.entity_at(split_base + Vector2i(-1, dy))
+		if input != null:
+			BeltSim.items_of(input).append({"lane": 1, "pos": 0.9,
+				"name": "iron-plate", "count": 1})
 
 	var under_base := origin + Vector2i(12, 12)
 	_place("transport-belt", "transport-belt", under_base + Vector2i(-1, 0), 4)
-	_place("underground-belt", "underground-belt", under_base, 4)
+	# Deliberately place the far half first: the game must still work out which
+	# end is the exit.  This is the reverse-order case that used to leave both
+	# halves marked as entrances.
 	_place("underground-belt", "underground-belt", under_base + Vector2i(4, 0), 4)
+	_place("underground-belt", "underground-belt", under_base, 4)
 	_place("transport-belt", "transport-belt", under_base + Vector2i(5, 0), 4)
 	# Something for the underground belt to tunnel under.
 	_place("transport-belt", "transport-belt", under_base + Vector2i(2, 0), 0)
+	# Put a plate on the feeding belt so the tunnel can be seen carrying it.
+	var feed := world.entity_at(under_base + Vector2i(-1, 0))
+	if feed != null:
+		for lane in 2:
+			BeltSim.items_of(feed).append({"lane": lane, "pos": 0.9,
+				"name": "iron-plate", "count": 1})
 
-	_spawn_cell = origin + Vector2i(14, 6)
+	_spawn_cell = origin + Vector2i(9, 8)
 	print("belt showroom: %d belts, %d splitters, %d underground" % [
 		world.entities_of_type("transport-belt").size(),
 		world.entities_of_type("splitter").size(),
@@ -972,6 +1183,20 @@ func _ensure_character_free() -> void:
 
 
 ## Nearest tile with no machine, no ore and no water — a safe place to stand.
+## Make a rectangular patch of dry, empty ground for a test showroom.
+func _flatten_showroom(origin: Vector2i, size: Vector2i) -> void:
+	var land := "dirt-1"
+	for tile_name: String in world.palette:
+		if not tile_name.begins_with("water") \
+				and not tile_name.begins_with("deepwater"):
+			land = tile_name
+			break
+	for y in size.y:
+		for x in size.x:
+			world.set_tile(origin + Vector2i(x, y), land)
+	world.clear_decoratives(Rect2i(origin, size))
+
+
 func _free_cell_near(origin: Vector2i, clearance := 0) -> Vector2i:
 	for radius in range(0, 40):
 		for step in range(0, maxi(radius * 8, 1)):
@@ -1164,9 +1389,140 @@ func _build_ui() -> void:
 
 	_build_toolbar()
 	_build_menus()
+	_build_touch_controls()
 
 	player.entity_activated.connect(_on_entity_activated)
 	get_viewport().size_changed.connect(_on_viewport_resized)
+
+
+## --------------------------------------------------------------------------
+## Touch / mobile HUD
+## --------------------------------------------------------------------------
+
+func _build_touch_controls() -> void:
+	if not touch_mode:
+		return
+	touch_controls = TouchControls.new()
+	touch_controls.name = "TouchControls"
+	hud.add_child(touch_controls)
+	touch_controls.move_changed.connect(_on_touch_move)
+	touch_controls.pointer_changed.connect(_on_touch_pointer)
+	touch_controls.action.connect(_on_touch_action)
+	player.touch_mode = true
+	player.virtual_mouse_enabled = true
+	player.touch_ui_check = _touch_ui_blocks
+	player.set_virtual_pointer(touch_controls.pointer_position())
+	_apply_touch_layout()
+
+
+func _on_touch_move(direction: Vector2) -> void:
+	if player != null:
+		player.touch_move = direction
+
+
+func _on_touch_pointer(point: Vector2) -> void:
+	if player != null:
+		player.set_virtual_pointer(point)
+
+
+## HUD panels that should never turn a touch into a world action when the
+## engine also delivers the raw screen-touch event to Player.
+func _touch_ui_blocks(point: Vector2) -> bool:
+	if touch_controls != null:
+		# The drawer is modal for world gestures; its own buttons still work.
+		if touch_controls.is_menu_open():
+			return true
+		if touch_controls.is_point_over_ui(point):
+			return true
+	for control: Control in [toolbar, minimap, alert_panel, weapon_panel,
+			objective_panel, recenter_button]:
+		if control != null and control.visible 				and control.get_global_rect().has_point(point):
+			return true
+	return false
+
+
+func _apply_touch_layout() -> void:
+	if hud == null:
+		return
+	var label := hud.get_node_or_null("DebugLabel") as Label
+	if label != null:
+		label.visible = not touch_mode
+	if touch_controls != null:
+		touch_controls.layout(get_viewport_rect().size)
+	if objective_panel == null:
+		return
+	if touch_mode:
+		# The joystick owns the bottom-left.  Put the tutorial at the top-left;
+		# its old bottom stack would cover the stick.
+		objective_panel.set_anchors_preset(Control.PRESET_TOP_LEFT)
+		objective_panel.offset_left = 12
+		objective_panel.offset_right = 356
+		objective_panel.offset_top = 12
+		objective_panel.offset_bottom = 180
+	else:
+		objective_panel.set_anchors_preset(Control.PRESET_BOTTOM_LEFT)
+		objective_panel.offset_left = 12
+		objective_panel.offset_right = 356
+		objective_panel.offset_top = -292
+		objective_panel.offset_bottom = -136
+
+
+func _on_touch_action(action_name: String) -> void:
+	if player == null:
+		return
+	match action_name:
+		"rotate":
+			player.rotate_at_hover()
+		"fire":
+			if character != null:
+				player.shoot_at(character.position)
+		"mouse_left":
+			player.virtual_left_click()
+		"mouse_right_down":
+			player.virtual_right_down()
+		"mouse_right_up":
+			player.virtual_right_up()
+		"inventory":
+			inventory_window.toggle()
+		"research":
+			research_window.toggle()
+		"map":
+			map_window.toggle(character.cell() if character != null else _spawn_cell)
+		"equipment":
+			equipment_window.toggle()
+		"production":
+			production_window.toggle()
+		"vehicle":
+			if player.driving != null:
+				player.exit_vehicle()
+			else:
+				player.enter_vehicle()
+		"pick":
+			player.pick_or_clear()
+		"remove":
+			player.secondary_action_at_hover()
+		"wire":
+			player.cycle_wire_colour()
+		"alt", "ore", "grid", "alerts":
+			var on := not toolbar.is_on(action_name)
+			toolbar.set_toggle(action_name, on)
+			_on_toolbar_toggled(action_name, on)
+		"home":
+			_centre_on_engineer()
+		"save":
+			save_game()
+		"load":
+			load_game()
+		"pause":
+			_open_pause_menu()
+		"zoom_in":
+			if camera != null:
+				camera.set_zoom_level(camera.zoom_level * 1.12,
+					get_viewport_rect().size * 0.5)
+		"zoom_out":
+			if camera != null:
+				camera.set_zoom_level(camera.zoom_level / 1.12,
+					get_viewport_rect().size * 0.5)
 
 
 ## The item on the cursor, drawn above every window.
@@ -1217,6 +1573,8 @@ func _update_cursor_item() -> void:
 	var item_name := str(held.get("name", ""))
 	_cursor_icon.texture = FactorioAssets.icon_for("item", item_name, 64)
 	var mouse := get_viewport().get_mouse_position()
+	if touch_mode and player.virtual_mouse_enabled:
+		mouse = player.virtual_mouse_position
 	_cursor_icon.position = mouse - Vector2(22, 22)
 	_cursor_icon.visible = _cursor_icon.texture != null
 	_cursor_count.text = str(int(held.get("count", 0)))
@@ -1227,6 +1585,7 @@ func _update_cursor_item() -> void:
 func _on_viewport_resized() -> void:
 	if ui_root != null:
 		UiKit.refill(ui_root)
+	_apply_touch_layout()
 
 
 func _on_entity_activated(entity: Entity) -> void:
@@ -1398,6 +1757,7 @@ func load_game(path := "") -> bool:
 	entity_window.close_window()
 	inventory_window.close_window()
 	research_window.close_window()
+	_preload_visuals()
 	_save_flash = 3.0
 	print("loaded '%s' (%d entities, %d chunks, tick %d)" % [
 		str(data.get("save_name", path.get_file())), world.entities.size(),
@@ -1598,6 +1958,18 @@ func _on_settings_changed(values: Dictionary) -> void:
 	game_settings = values
 	_apply_settings()
 	_save_settings()
+
+
+## Decode the art a fresh view will need before the first frame that shows it.
+## Headless runs draw nothing, and phones have little enough memory that the
+## lazy path is safer there.
+func _preload_visuals() -> void:
+	if renderer == null or DisplayServer.get_name() == "headless" \
+			or OS.has_feature("mobile"):
+		return
+	renderer.preload_ground_images()
+	if character != null:
+		renderer.prewarm_entity_visuals(Vector2i(character.position), 2)
 
 
 func _load_settings() -> void:
@@ -1831,6 +2203,7 @@ func _start_new_game(settings: Dictionary = {}) -> void:
 		objectives.current = 0
 	if objective_panel != null:
 		objective_panel.refresh()
+	_preload_visuals()
 	print("new game: seed %d" % _seed)
 
 
