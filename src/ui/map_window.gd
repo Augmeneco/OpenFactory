@@ -41,6 +41,19 @@ var _frames := 0
 ## than a stamped pixel: it stays visible while the map is panned and does not
 ## force the whole picture to rebuild every time the engineer takes a step.
 var _marker: ColorRect
+## Hover tooltip for an ore tile, Factorio's "Iron ore 908k".
+var _ore_tip: PanelContainer
+var _ore_icon: TextureRect
+var _ore_label: Label
+## Cached patch sum for the tile under the cursor: a large ore field should not
+## be re-flood-filled on every mouse-motion event.
+var _ore_patch_cell := Vector2i(2147483647, 2147483647)
+var _ore_patch_name := ""
+var _ore_patch_amount := 0.0
+## Every cell of the patch we just summed, so moving one tile along a huge
+## field does not flood-fill it again.
+var _ore_patch_cells: Dictionary = {}
+var _ore_patch_revision := -1
 var _chunks: MapChunks
 var _last_revision := -1
 var _last_tiles := Vector2i.ZERO
@@ -112,6 +125,32 @@ func _build() -> void:
 	_marker.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	_marker.visible = false
 	_picture.add_child(_marker)
+
+	_ore_tip = PanelContainer.new()
+	var tip_style := FactorioStyle.stylebox("tooltip_frame", "default")
+	if tip_style == null:
+		tip_style = FactorioStyle.stylebox("frame", "default")
+	if tip_style != null:
+		_ore_tip.add_theme_stylebox_override("panel", tip_style)
+	_ore_tip.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ore_tip.z_index = 200
+	_ore_tip.visible = false
+	var tip_row := UiKit.row(5)
+	tip_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ore_icon = TextureRect.new()
+	_ore_icon.custom_minimum_size = Vector2(22, 22)
+	_ore_icon.size = Vector2(22, 22)
+	_ore_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_ore_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_ore_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tip_row.add_child(_ore_icon)
+	_ore_label = UiKit.label("", "label")
+	_ore_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tip_row.add_child(_ore_label)
+	_ore_tip.add_child(tip_row)
+	add_child(_ore_tip)
+
+	_picture.mouse_exited.connect(func() -> void: _ore_tip.visible = false)
 
 
 func _toggle(text: String, on: bool, action: Callable) -> CheckBox:
@@ -292,28 +331,114 @@ func zoom_by(steps: float) -> void:
 
 
 func _on_picture_input(event: InputEvent) -> void:
+	if event is InputEventMouseMotion:
+		_update_ore_tip((event as InputEventMouseMotion).position)
+		return
 	if not (event is InputEventMouseButton):
 		return
 	var button := event as InputEventMouseButton
 	if not button.pressed or button.button_index != MOUSE_BUTTON_LEFT:
 		return
-	if _last_tiles.x <= 0 or _last_tiles.y <= 0 or _picture == null:
+	var cell := _cell_at(button.position)
+	if cell == Vector2i(2147483647, 2147483647):
 		return
-	var extent := _picture.size
-	if extent.x <= 0.0 or extent.y <= 0.0:
-		return
-	var local := Vector2i(
-		int(clampf(floor(button.position.x / extent.x * _last_tiles.x),
-			0.0, float(_last_tiles.x - 1))),
-		int(clampf(floor(button.position.y / extent.y * _last_tiles.y),
-			0.0, float(_last_tiles.y - 1))))
-	var cell := origin + local
 	var coord := GameWorld.chunk_of(cell)
 	if not world.is_generated(coord) or not world.is_chunk_revealed(coord):
 		_status.text = "No satellite data here — place a powered radar to scan this chunk."
 		return
 	view_requested.emit(cell)
 
+
+## The tile under a point in the map picture, or a sentinel outside it.
+func _cell_at(local: Vector2) -> Vector2i:
+	if _last_tiles.x <= 0 or _last_tiles.y <= 0 or _picture == null:
+		return Vector2i(2147483647, 2147483647)
+	var extent := _picture.size
+	if extent.x <= 0.0 or extent.y <= 0.0:
+		return Vector2i(2147483647, 2147483647)
+	if local.x < 0.0 or local.y < 0.0 or local.x >= extent.x or local.y >= extent.y:
+		return Vector2i(2147483647, 2147483647)
+	var offset := Vector2i(
+		int(floor(local.x / extent.x * _last_tiles.x)),
+		int(floor(local.y / extent.y * _last_tiles.y)))
+	offset.x = clampi(offset.x, 0, _last_tiles.x - 1)
+	offset.y = clampi(offset.y, 0, _last_tiles.y - 1)
+	return origin + offset
+
+
+## Name the ore under the cursor, with the same rounded amount Factorio uses.
+func _update_ore_tip(local: Vector2) -> void:
+	if world == null or not show_ore:
+		_ore_tip.visible = false
+		return
+	var cell := _cell_at(local)
+	if cell == Vector2i(2147483647, 2147483647):
+		_ore_tip.visible = false
+		return
+	var coord := GameWorld.chunk_of(cell)
+	if not world.is_generated(coord):
+		_ore_tip.visible = false
+		return
+	var ore := world.ore_at(cell)
+	var ore_name := str(ore["name"])
+	if ore_name.is_empty() or float(ore["amount"]) <= 0.0:
+		_ore_tip.visible = false
+		return
+	var resource := Prototypes.get_p("resource", ore_name)
+	_ore_icon.texture = FactorioAssets.prototype_icon(resource, 64)
+	_ore_icon.set_meta("factorio_icon", "resource-%s" % ore_name)
+	var total := _ore_patch_total(cell, ore_name)
+	_ore_label.text = "%s  %s" % [Loc.proto_name("resource", ore_name),
+		_format_amount(total)]
+	_ore_tip.visible = true
+	_ore_tip.reset_size()
+	var wanted := _picture.global_position + local + Vector2(16, 16)
+	var view := get_viewport_rect().size
+	wanted.x = clampf(wanted.x, 4.0, maxf(4.0, view.x - _ore_tip.size.x - 4.0))
+	wanted.y = clampf(wanted.y, 4.0, maxf(4.0, view.y - _ore_tip.size.y - 4.0))
+	_ore_tip.global_position = wanted
+
+
+## Sum the contiguous ore field around a cell.  Factorio's map shows the whole
+## patch, not just the one tile the cursor happens to be over.
+func _ore_patch_total(start: Vector2i, ore_name: String) -> float:
+	if world.revision != _ore_patch_revision:
+		_ore_patch_cells.clear()
+		_ore_patch_revision = world.revision
+	if ore_name == _ore_patch_name and _ore_patch_cells.has(start):
+		return _ore_patch_amount
+	if start == _ore_patch_cell and ore_name == _ore_patch_name:
+		return _ore_patch_amount
+	var total := 0.0
+	var seen: Dictionary = {}
+	var queue: Array[Vector2i] = [start]
+	var guard := 0
+	while not queue.is_empty() and guard < 20000:
+		guard += 1
+		var cell: Vector2i = queue.pop_back()
+		if seen.has(cell):
+			continue
+		seen[cell] = true
+		var ore := world.ore_at(cell)
+		if str(ore["name"]) != ore_name or float(ore["amount"]) <= 0.0:
+			continue
+		total += float(ore["amount"])
+		for step: Vector2i in [Vector2i.LEFT, Vector2i.RIGHT,
+				Vector2i.UP, Vector2i.DOWN]:
+			queue.append(cell + step)
+	_ore_patch_cell = start
+	_ore_patch_name = ore_name
+	_ore_patch_amount = total
+	_ore_patch_cells = seen
+	return total
+
+
+static func _format_amount(amount: float) -> String:
+	if amount >= 1000000.0:
+		return "%.1fM" % (amount / 1000000.0)
+	if amount >= 1000.0:
+		return "%.1fk" % (amount / 1000.0)
+	return str(int(round(amount)))
 
 func _process(_delta: float) -> void:
 	if not visible:

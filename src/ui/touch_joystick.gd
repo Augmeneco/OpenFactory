@@ -10,6 +10,7 @@ signal moved(direction: Vector2)
 
 const KNOB_RADIUS := 30.0
 
+var ui_scale := 1.0
 var _active := false
 var _active_id := -1
 var _mouse_active := false
@@ -31,9 +32,10 @@ func _draw() -> void:
 	draw_arc(centre, radius * 0.56, 0.0, TAU, 40,
 		Color(0.78, 0.64, 0.28, 0.25), 1.0, true)
 	var knob := centre + _direction * radius * 0.55
-	draw_circle(knob, KNOB_RADIUS, Color(0.72, 0.57, 0.24, 0.9))
-	draw_arc(knob, KNOB_RADIUS, 0.0, TAU, 32,
-		Color(1.0, 0.9, 0.58, 1.0), 2.0, true)
+	var knob_radius := KNOB_RADIUS * ui_scale
+	draw_circle(knob, knob_radius, Color(0.72, 0.57, 0.24, 0.9))
+	draw_arc(knob, knob_radius, 0.0, TAU, 32,
+		Color(1.0, 0.9, 0.58, 1.0), 2.0 * ui_scale, true)
 
 
 func _gui_input(event: InputEvent) -> void:

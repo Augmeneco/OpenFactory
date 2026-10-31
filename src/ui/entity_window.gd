@@ -199,7 +199,7 @@ func _build() -> void:
 func _refresh_rocket() -> void:
 	if _rocket_box == null or entity == null:
 		return
-	var is_silo := entity.proto_type == "rocket-silo"
+	var is_silo := entity.proto_type == "rocket-silo" and not entity.is_ghost()
 	_rocket_box.visible = is_silo
 	if not is_silo or simulation == null:
 		return
@@ -226,8 +226,10 @@ func _on_launch_pressed() -> void:
 func _refresh_train() -> void:
 	if _train_box == null:
 		return
+	# A ghost train stop can still have its name set before it is built; a
+	# ghost locomotive has no schedule yet.
 	var is_stop := entity.proto_type == "train-stop"
-	var train := _train_of(entity)
+	var train := _train_of(entity) if not entity.is_ghost() else {}
 	var is_locomotive := not train.is_empty()
 	_train_box.visible = is_stop or is_locomotive
 	_station_field.get_parent().visible = is_stop
@@ -270,7 +272,7 @@ func open_train(target: Dictionary) -> void:
 
 ## The sound of whatever lid the machine has, if the prototype declares one.
 func _play_lid(open: bool) -> void:
-	if entity == null:
+	if entity == null or entity.is_ghost():
 		return
 	var proto := entity.prototype()
 	var reference: Variant = proto.get("open_sound" if open else "close_sound")
@@ -514,7 +516,7 @@ func _rebuild_fluid_rows() -> void:
 	for label: Node in _fluid_labels:
 		label.queue_free()
 	_fluid_labels.clear()
-	var specs := FluidSystem.box_specs(entity)
+	var specs := FluidSystem.box_specs(entity) if not entity.is_ghost() else []
 	if specs.is_empty():
 		_fluid_box.visible = false
 		return
@@ -598,6 +600,20 @@ func refresh() -> void:
 		return
 	var proto := entity.prototype()
 	_title.text = Loc.proto_display_name(proto, entity.name)
+	if entity.is_ghost():
+		# A ghost has no inventories, progress or fluids to poll.  Keep the
+		# recipe and request sections so the plan can be configured, and say
+		# clearly that it is waiting to be built.
+		_refresh_train()
+		_refresh_rocket()
+		_status.visible = true
+		var configured := str(entity.state.get("recipe", ""))
+		_status.text = "Ghost — will keep %s when built" % (
+			Loc.proto_name("recipe", configured) if not configured.is_empty()
+			else "its settings")
+		_progress.visible = false
+		_refresh_cursor()
+		return
 	_refresh_train()
 	_refresh_rocket()
 

@@ -9,6 +9,15 @@ extends RefCounted
 
 const TICKS_PER_SECOND := 60
 const TICK_DELTA := 1.0 / 60.0
+## Factorio measures inserter buffers in "one full normal inserter swing".
+## The standard inserter takes 1.166 s per full turn.
+const INSERTER_SWING_SECONDS := 1.166
+const MIN_INSERTION_CRAFTS := 2
+const MAX_INSERTION_CRAFTS := 100
+const NO_INSERTION_LIMIT := 1_000_000
+## cached "machine type | configured recipe | item -> recipe" lookups used by
+## the inserter buffer limit
+static var _insertion_recipe_cache: Dictionary = {}
 
 var world: GameWorld
 var power: PowerNetwork
@@ -37,6 +46,13 @@ var day: DayCycle
 ## Living enemies.  Biters walk off the tile grid, so they are not world
 ## entities (which are keyed by tile) but plain records with a float position.
 var units: Array = []
+## Acid puddles left by spitters.  They hurt the engineer, not buildings, and
+## evaporate after Factorio's 32 seconds.
+var acid_puddles: Array = []
+## Short-lived turret tracers for the renderer.
+var turret_shots: Array = []
+## Dead biters/spitters, which play their death animation, rot, then vanish.
+var corpses: Array = []
 ## A hard ceiling on simultaneously simulated biters.  Spawners keep their own
 ## local caps, but a large explored biter region can otherwise accumulate
 ## thousands of off-screen units and tank the frame rate.
@@ -48,7 +64,7 @@ var evolution := 0.0
 ## World-settings multiplier for how fast evolution grows.
 var evolution_speed := 1.0
 ## New chunks inside this many chunks around the start do not receive nests.
-var enemy_safe_chunks := 14
+var enemy_safe_chunks := DEFAULT_ENEMY_SAFE_CHUNKS
 ## Player start, in chunk coordinates; set once the engineer's spawn is known.
 var enemy_safe_center := Vector2i.ZERO
 var _elapsed_seconds := 0.0
@@ -129,6 +145,10 @@ func step() -> void:
 		return
 	tick += 1
 	trains.update()
+	# Fire cooldown and natural regeneration are per simulation tick, not per
+	# rendered frame; without this the first shot left the trigger stuck.
+	if character != null:
+		character.advance_health()
 	circuits.update()
 	day.tick()
 	statistics.advance(tick)
@@ -272,42 +292,17 @@ static func _belt_ready_item(belt: Entity, lane := -1) -> Dictionary:
 ## Hovering an entrance looks forward for its exit; hovering the exit looks
 ## back for its entrance.  The renderer uses this for the yellow link line.
 func underground_link(entity: Entity) -> Entity:
-	if entity == null or entity.proto_type != "underground-belt":
-		return null
-	if str(entity.state.get("io", "input")) != "output":
-		return _underground_partner(entity)
-	var proto := entity.prototype()
-	var max_distance := int(proto.get("max_distance", 5))
-	var step := BeltSim.dir_vector(entity.direction)
-	for k in range(1, max_distance + 1):
-		var other := world.entity_at(entity.origin - step * k)
-		if other == null:
-			continue
-		if other.proto_type != "underground-belt" or other.name != entity.name:
-			continue
-		if posmod(other.direction, 16) != posmod(entity.direction, 16):
-			continue
-		if str(other.state.get("io", "input")) == "input":
-			return other
-	return null
+	return world.underground_partner(entity)
+
+
+## The other half of a pipe-to-ground tunnel, for the hover link line.
+func underground_pipe_link(entity: Entity) -> Entity:
+	return FluidSystem.underground_pipe_partner(world, entity)
 
 
 ## The exit an underground belt entrance leads to, or ``null``.
 func _underground_partner(entrance: Entity) -> Entity:
-	var proto := entrance.prototype()
-	var max_distance := int(proto.get("max_distance", 5))
-	var step := BeltSim.dir_vector(entrance.direction)
-	for k in range(1, max_distance + 1):
-		var other := world.entity_at(entrance.origin + step * k)
-		if other == null:
-			continue
-		if other.proto_type != "underground-belt" or other.name != entrance.name:
-			continue
-		if posmod(other.direction, 16) != posmod(entrance.direction, 16):
-			continue
-		if str(other.state.get("io", "input")) == "output":
-			return other
-	return null
+	return world.underground_partner(entrance)
 
 
 ## Underground belts swallow items at one end and spit them out at the other.
@@ -668,6 +663,108 @@ func _primary_inventory(entity: Entity, item_name: String, for_input: bool) -> I
 	return InventoryLayout.get_inventory(entity, InventoryLayout.OUTPUT)
 
 
+## How many of ``item_name`` an inserter may keep in this entity.
+##
+## Factorio deliberately does not let inserters fill a producer's whole
+## inventory: fuel stops at 5, turret ammunition at 10, and recipe inputs stop
+## at one craft plus whatever the machine can finish during one inserter
+## swing (at least two crafts, at most 100).  Labs use the same idea with
+## research units.  Chests, wagons and cars are the deliberate exceptions.
+func _insertion_limit(entity: Entity, item_name: String) -> int:
+	var proto := entity.prototype()
+	var type_name := str(proto.get("type", entity.proto_type))
+	if type_name in ["container", "logistic-container", "car",
+			"spider-vehicle", "locomotive", "cargo-wagon", "fluid-wagon",
+			"artillery-wagon"]:
+		return NO_INSERTION_LIMIT
+	if type_name == "ammo-turret" or type_name == "electric-turret":
+		return 10
+	if type_name == "artillery-turret":
+		return 5
+	if type_name in ["boiler", "reactor"] and Energy.is_fuel(item_name):
+		return 5
+	# Fuel is a small buffer everywhere it is burned, so one furnace cannot
+	# hoard a stack of coal and starve every furnace behind it on the belt.
+	if Energy.is_fuel(item_name) and Energy.is_burner(proto):
+		return 5
+	if type_name == "lab":
+		return _lab_insertion_limit(entity, item_name)
+	if type_name in ["furnace", "assembling-machine", "rocket-silo"]:
+		var recipe := _recipe_for_machine_item(entity, item_name)
+		if recipe.is_empty():
+			return NO_INSERTION_LIMIT
+		var per_craft := _ingredient_amount(recipe, item_name)
+		if per_craft <= 0:
+			return NO_INSERTION_LIMIT
+		return per_craft * _machine_craft_limit(proto, recipe)
+	return NO_INSERTION_LIMIT
+
+
+## Number of crafts whose ingredients the machine may buffer.
+func _machine_craft_limit(proto: Dictionary, recipe: Dictionary) -> int:
+	var speed := maxf(float(proto.get("crafting_speed", 1.0)), 1e-6)
+	var seconds := maxf(Prototypes.recipe_energy(recipe) / speed, 1e-6)
+	var cycles := int(ceil(INSERTER_SWING_SECONDS / seconds))
+	return clampi(1 + cycles, MIN_INSERTION_CRAFTS, MAX_INSERTION_CRAFTS)
+
+
+func _lab_insertion_limit(lab: Entity, item_name: String) -> int:
+	var amount := 1
+	if research != null and not research.current.is_empty():
+		for pack: Dictionary in _required_packs():
+			if str(pack.get("name", "")) == item_name:
+				amount = maxi(1, int(pack.get("amount", 1)))
+				break
+	var proto := lab.prototype()
+	var speed := maxf(float(proto.get("researching_speed", 1.0)), 1e-6)
+	var seconds := 1.0
+	if research != null:
+		seconds = maxf(research.unit_time() / speed, 1e-6)
+	var cycles := int(ceil(INSERTER_SWING_SECONDS / seconds))
+	var units := clampi(1 + cycles, MIN_INSERTION_CRAFTS, MAX_INSERTION_CRAFTS)
+	return amount * units
+
+
+## The recipe a producer would use for this input.  A configured recipe is
+## authoritative; otherwise the first recipe of the machine's categories that
+## actually consumes the item is used (this is what lets a furnace accept ore
+## before its first craft has chosen a recipe).
+func _recipe_for_machine_item(entity: Entity, item_name: String) -> Dictionary:
+	var configured := str(entity.state.get("recipe", ""))
+	if not configured.is_empty() and _recipe_uses_item(configured, item_name):
+		return Prototypes.get_p("recipe", configured)
+	var proto := entity.prototype()
+	var type_name := str(proto.get("type", entity.proto_type))
+	var cache_key := "%s|%s|%s" % [type_name, configured, item_name]
+	if _insertion_recipe_cache.has(cache_key):
+		return _insertion_recipe_cache[cache_key]
+	var categories: Variant = proto.get("crafting_categories", [])
+	if type_name == "furnace":
+		categories = ["smelting"]
+	elif type_name == "rocket-silo":
+		categories = ["rocket-building", "crafting"]
+	if not (categories is Array):
+		_insertion_recipe_cache[cache_key] = {}
+		return {}
+	for category: Variant in categories:
+		for recipe_name: String in Prototypes.recipes_in_category(str(category)):
+			if _recipe_uses_item(recipe_name, item_name):
+				var found := Prototypes.get_p("recipe", recipe_name)
+				_insertion_recipe_cache[cache_key] = found
+				return found
+	_insertion_recipe_cache[cache_key] = {}
+	return {}
+
+
+static func _ingredient_amount(recipe: Dictionary, item_name: String) -> int:
+	var total := 0
+	for ingredient: Dictionary in Prototypes.recipe_ingredients(recipe):
+		if str(ingredient.get("type", "item")) == "item" \
+				and str(ingredient.get("name", "")) == item_name:
+			total += int(ingredient.get("amount", 0))
+	return total
+
+
 func _can_insert(entity: Entity, item_name: String, cell: Vector2i,
 		inserter: Entity) -> int:
 	if BeltSim.is_belt(entity):
@@ -687,7 +784,11 @@ func _can_insert(entity: Entity, item_name: String, cell: Vector2i,
 	var inventory := _primary_inventory(entity, item_name, true)
 	if inventory == null:
 		return 0
-	return inventory.can_accept(item_name, 1)
+	var limit := _insertion_limit(entity, item_name)
+	var current := inventory.count_of(item_name)
+	if current >= limit:
+		return 0
+	return mini(inventory.can_accept(item_name, 1), limit - current)
 
 
 ## Whether ``entity`` can process ``item_name`` as an ingredient, fuel, module
@@ -701,7 +802,7 @@ func _accepts_input(entity: Entity, item_name: String) -> bool:
 				"locomotive", "cargo-wagon", "fluid-wagon", "artillery-wagon":
 			return true
 		"furnace":
-			if Energy.is_fuel(item_name):
+			if Energy.is_fuel(item_name) and Energy.is_burner(proto):
 				return true
 			return _ingredient_accepted_by(entity, ["smelting"], item_name)
 		"assembling-machine", "rocket-silo":
@@ -788,19 +889,45 @@ func _ammo_fits_turret(proto: Dictionary, item_name: String) -> bool:
 	return str(ammo.get("ammo_category", "")) == wanted
 
 
+## Which belt lane an inserter drops into.
+##
+## Factorio: if the belt runs the same or the opposite way as the inserter,
+## the drop is on the right lane from the belt's perspective.  Perpendicular
+## insertion and curves use the lane furthest from the inserter.  The choice
+## is fixed; a full lane makes the inserter wait, never switch sides.
+func _inserter_belt_lane(belt: Entity, inserter: Entity) -> int:
+	var near := BeltSim.lane_for_position(belt, inserter.center())
+	var direction := posmod(belt.direction, 16)
+	var straight := int(EntityVisuals.BELT_STRAIGHT.get(direction, 0))
+	var curved := EntityVisuals.belt_shape_row(world, belt) != straight
+	var delta := posmod(inserter.direction - direction, 16)
+	if not curved and (delta == 0 or delta == 8):
+		return 1  # right-hand lane from the belt's perspective
+	return 1 - near
+
+
 func _insert_into(entity: Entity, item_name: String, amount: int, cell: Vector2i,
 		inserter: Entity) -> int:
 	if BeltSim.is_belt(entity):
 		# Factorio inserters do not put a whole carried stack onto a belt as a
 		# single belt item.  They drop the hand one item at a time; keep the
 		# rest in the hand and let the next ticks finish the same swing.
-		var lane := BeltSim.lane_for_position(entity, inserter.center())
-		return BeltSim.try_insert(entity, item_name, mini(amount, 1), lane)
+		var lane := _inserter_belt_lane(entity, inserter)
+		# `false`: never fall back to the other lane when this one is full.
+		# The item waits in the hand; otherwise an inserter visibly starts
+		# filling the opposite side as soon as the first lane backs up.
+		return BeltSim.try_insert(entity, item_name, mini(amount, 1), lane, false)
 	var inventory := _primary_inventory(entity, item_name, true)
 	if inventory == null:
 		return 0
-	var leftover := inventory.insert(item_name, amount)
-	return amount - leftover
+	# Do not overfill a producer's input slot just because the inserter hand
+	# happens to hold a whole stack.  The remainder stays in the hand.
+	var limit := _insertion_limit(entity, item_name)
+	var room := limit - inventory.count_of(item_name)
+	if room <= 0:
+		return 0
+	var leftover := inventory.insert(item_name, mini(amount, room))
+	return mini(amount, room) - leftover
 
 
 # --------------------------------------------------------------------------
@@ -937,6 +1064,8 @@ func _update_miner(drill: Entity) -> void:
 				moved = mined
 		if moved < mined and output != null:
 			output.insert(item_name, mined - moved)
+		drill.state["produced_total"] = int(
+			drill.state.get("produced_total", 0)) + mined
 		stats["mined"] = int(stats["mined"]) + mined
 		if statistics != null:
 			statistics.record_produced(item_name, mined)
@@ -1156,6 +1285,8 @@ func _update_crafting_machine(machine: Entity) -> void:
 		if research != null:
 			research.on_item_produced(str(product["name"]), int(product["amount"]))
 	machine.state["progress"] = 0.0
+	machine.state["produced_total"] = int(
+		machine.state.get("produced_total", 0)) + 1
 	stats["crafts"] = int(stats["crafts"]) + 1
 	if str(recipe.get("category", "")) != "smelting":
 		# Assemblers keep their recipe; furnaces re-pick from what is left.
@@ -1615,7 +1746,7 @@ func _update_logistics() -> void:
 
 ## Chunks nearer than this to the origin never hold a nest, so the player has
 ## somewhere to build before the biters notice.
-const DEFAULT_ENEMY_SAFE_CHUNKS := 14
+const DEFAULT_ENEMY_SAFE_CHUNKS := 5
 ## Chance that a chunk past the safe ring holds a nest.
 const ENEMY_BASE_CHANCE := 0.30
 
@@ -1706,6 +1837,9 @@ func _destroy_entity(entity: Entity, attacker: Variant = null) -> void:
 			if slot != null and int(slot.get("count", 0)) > 0:
 				spilled.emit(entity.center(), str(slot["name"]), int(slot["count"]))
 	entity_destroyed.emit(entity, attacker)
+	if entity.proto_type == "unit-spawner":
+		stats["spawners_destroyed"] = int(
+			stats.get("spawners_destroyed", 0)) + 1
 	world.remove_entity(entity)
 	stats["destroyed"] = int(stats.get("destroyed", 0)) + 1
 
@@ -1748,10 +1882,13 @@ func unit_prototype(unit: Dictionary) -> Dictionary:
 ## Time and pollution are modelled here; kills are not counted yet.
 func _update_evolution() -> void:
 	_elapsed_seconds += TICK_DELTA
-	var from_time := _elapsed_seconds / 360000.0          # 0.1 after ten hours
-	var from_pollution := _pollution_produced / 2500000.0  # 0.1 per 250k units
-	evolution = clampf((from_time + from_pollution) * maxf(evolution_speed, 0.0),
-		0.0, 1.0)
+	# Factorio's three sources, then the squash that keeps evolution below 1:
+	# time 0.000004/s, one pollution unit 0.0000009, one nest 0.002.
+	var total := _elapsed_seconds * 0.000004 \
+		+ _pollution_produced * 0.0000009 \
+		+ float(stats.get("spawners_destroyed", 0)) * 0.002
+	total *= maxf(evolution_speed, 0.0)
+	evolution = clampf(total / (1.0 + total), 0.0, 0.999)
 
 
 ## Pick which unit a nest may spawn at the current evolution.
@@ -1809,6 +1946,55 @@ static func _interpolate_evolution(table: Variant, evolution_factor: float) -> f
 	return lerpf(float(previous[1]), float(next[1]), t)
 
 
+## Put nests into ground that was generated before the safe radius shrank.
+##
+## Nests are normally placed as chunks generate, so a save made while the
+## start area was 14 chunks wide has no nests at all in its explored ring.
+## Loading such a save gets a handful of nests at the new edge instead.
+func seed_enemy_nests() -> int:
+	if world == null:
+		return 0
+	if not world.entities_of_type("unit-spawner").is_empty():
+		return 0
+	# A save that has already had nests (even destroyed ones) is not re-seeded;
+	# only the old, nestless saves get a fresh population.
+	if int(stats.get("nests", 0)) > 0:
+		return 0
+	var placed := 0
+	var chunks: Array = world._chunks.keys()
+	chunks.sort_custom(func(a: Vector2i, b: Vector2i) -> bool:
+		return a.x * a.x + a.y * a.y < b.x * b.x + b.y * b.y)
+	for coord: Vector2i in chunks:
+		if placed >= 4:
+			break
+		var from_start := coord - enemy_safe_center
+		var distance := from_start.x * from_start.x + from_start.y * from_start.y
+		if distance < enemy_safe_chunks * enemy_safe_chunks:
+			continue
+		if distance > (enemy_safe_chunks + 3) * (enemy_safe_chunks + 3):
+			continue
+		if MapGenerator.hash01(coord, 0x8BAD) > ENEMY_BASE_CHANCE:
+			continue
+		var rng := RandomNumberGenerator.new()
+		rng.seed = hash(Vector2i(coord) * 31 + Vector2i(7, 13))
+		var centre := coord * GameWorld.CHUNK + Vector2i(GameWorld.CHUNK / 2,
+			GameWorld.CHUNK / 2)
+		var nest_cell := centre + Vector2i(rng.randi_range(-10, 10),
+			rng.randi_range(-10, 10))
+		var spawner := Entity.create("unit-spawner", "biter-spawner", nest_cell, 0)
+		if not world.place_entity(spawner):
+			continue
+		placed += 1
+		stats["nests"] = int(stats.get("nests", 0)) + 1
+		# Every nest starts with a couple of defenders, as in Factorio.
+		for i in 2:
+			var angle := rng.randf() * TAU
+			var unit := spawn_unit("small-biter", spawner.center()
+				+ Vector2(cos(angle), sin(angle)) * 3.0)
+			unit["spawner"] = spawner
+	return placed
+
+
 ## Drop nests and units that ended up inside the start safe zone.  Chunks
 ## around the start can be generated while the factory anchor is being found,
 ## before the exact spawn (and therefore the safe centre) is known.
@@ -1831,6 +2017,8 @@ func _update_enemies() -> void:
 	_update_evolution()
 	_update_spawners()
 	_update_units()
+	_update_acid_puddles()
+	_update_corpses()
 
 
 ## A nest soaks up pollution and turns it into biters.
@@ -1858,7 +2046,11 @@ func _update_spawners() -> void:
 			if pollution_entry is Dictionary:
 				rate = float(pollution_entry.get("absolute", 0.0)) 					+ float(pollution_entry.get("proportional", 0.0)) 					* pollution.pollution_at(spawner.origin)
 		var eaten := pollution.absorb(spawner.origin, rate * TICK_DELTA)
-		if eaten <= 0.0 and int(owned.get(spawner, 0)) == 0:
+		# A nest always keeps a few defenders even before pollution reaches it;
+		# otherwise a fresh nest was an empty building until the factory spread
+		# enough smog, and players never met the enemies at all.
+		var defenders := int(proto.get("max_count_of_owned_units", 7)) / 3
+		if eaten <= 0.0 and int(owned.get(spawner, 0)) >= maxi(1, defenders):
 			spawner.state["spawn_cooldown"] = 30
 			continue
 
@@ -1926,12 +2118,41 @@ func _update_units() -> void:
 			unit["cooldown"] = cooldown - 1
 
 		var step := float(proto.get("movement_speed", 0.2))
+		var min_distance := float(attack.get("min_attack_distance", 0.0)) \
+			if attack is Dictionary else 0.0
+		if min_distance > 0.0 and distance < min_distance - 0.5:
+			# Spitters back away to their minimum range instead of letting the
+			# engineer stand on top of them.
+			var away := (position - target_position)
+			if away.length() > 0.001:
+				unit["position"] = position + away.normalized() * step
+				unit["direction"] = _direction_from_vector(away)
+				unit["moving"] = true
+				unit["animation"] = float(unit.get("animation", 0.0)) + 1.0
+			continue
 		if distance > reach + step:
 			var heading := target_position - position
 			if heading.length() > 0.001:
 				var direction := heading.normalized()
+				var next := position + direction * step
+				var next_cell := Vector2i(int(floor(next.x)), int(floor(next.y)))
+				# A building in the way is something to chew through, not to
+				# walk inside.  This is what makes walls and turret line-ups
+				# matter the way they do in Factorio.
+				var blocker := world.entity_at(next_cell)
+				if blocker != null and not blocker.is_ghost() \
+						and _is_player_building(blocker):
+					unit["target"] = blocker
+					unit["targeting_player"] = false
+					unit["moving"] = false
+					unit["position"] = position
+					continue
+				if world.generator._is_water(world.tile_at(next_cell)):
+					unit["moving"] = false
+					unit["position"] = position
+					continue
 				unit["direction"] = _direction_from_vector(direction)
-				unit["position"] = position + direction * step
+				unit["position"] = next
 				unit["moving"] = true
 				# The run sheet animates with distance covered, not with time.
 				unit["animation"] = float(unit.get("animation", 0.0)) + 1.0
@@ -2022,23 +2243,122 @@ static func _is_player_building(entity: Entity) -> bool:
 	return true
 
 
+## A corpse starts as the death animation and then switches to the decay
+## sheet; when that finishes the body is gone.
+func _update_corpses() -> void:
+	var alive: Array = []
+	for corpse: Dictionary in corpses:
+		var proto := Prototypes.get_p("corpse", str(corpse.get("name", "")))
+		if proto.is_empty():
+			continue
+		var stage := str(corpse.get("stage", "death"))
+		var frames := _corpse_frames(proto, stage)
+		if frames <= 0:
+			continue
+		var frame := float(corpse.get("frame", 0.0))
+		if stage == "death":
+			var speed := float(proto.get("dying_speed", 0.018)) * 60.0
+			frame += maxf(0.05, speed)
+			if frame >= frames - 1:
+				corpse["stage"] = "decay"
+				corpse["frame"] = 0.0
+				frame = 0.0
+		else:
+			# Rot visibly over a few seconds instead of Factorio's quarter of
+			# an hour, so the decomposition can actually be seen in play.
+			# About ten seconds of visible rot: slow enough to read, short
+			# enough that a battlefield eventually clears itself.
+			frame += 0.04
+			if frame >= frames:
+				continue
+		corpse["frame"] = frame
+		alive.append(corpse)
+	corpses = alive
+
+
+static func _corpse_frames(proto: Dictionary, stage: String) -> int:
+	var node: Variant = proto.get("decay_animation" if stage == "decay" 		else "animation")
+	if node is Dictionary:
+		if node.has("frame_count"):
+			return int(node["frame_count"])
+		var layers: Variant = node.get("layers")
+		if layers is Array and not (layers as Array).is_empty():
+			var first: Variant = (layers as Array)[0]
+			if first is Dictionary and first.has("frame_count"):
+				return int(first["frame_count"])
+	elif node is Array and not (node as Array).is_empty():
+		return _corpse_frames({"animation": (node as Array)[0]}, stage)
+	return 1
+
+
+func _spawn_corpse(unit: Dictionary) -> void:
+	var proto := unit_prototype(unit)
+	var corpse_name := str(proto.get("corpse", ""))
+	if corpse_name.is_empty():
+		return
+	if corpses.size() >= 12:
+		corpses.pop_front()
+	corpses.append({
+		"name": corpse_name,
+		"position": Vector2(unit.get("position", Vector2.ZERO)),
+		"direction": int(unit.get("direction", 8)),
+		"stage": "death",
+		"frame": 0.0,
+	})
+
+
+## Spitter acid on the ground: damage over time to the engineer.
+func _update_acid_puddles() -> void:
+	var alive: Array = []
+	for puddle: Dictionary in acid_puddles:
+		if tick >= int(puddle.get("until", 0)):
+			continue
+		alive.append(puddle)
+		if character == null or not character.is_alive():
+			continue
+		if tick % 30 != 0:
+			continue
+		var radius := float(puddle.get("radius", 1.0))
+		if Vector2(puddle["position"]).distance_to(character.position) <= radius:
+			character.take_damage(float(puddle.get("dps", 7.2)) * 0.5, "acid")
+	acid_puddles = alive
+
+
 ## One bite or spit, on whatever the biter was heading for.
 func _unit_attacks(unit: Dictionary, proto: Dictionary) -> bool:
-	var damage := _attack_damage(proto.get("attack_parameters", {}))
+	var attack: Variant = proto.get("attack_parameters", {})
+	var stream := attack is Dictionary and str(attack.get("type", "")) == "stream"
+	var damage := _attack_damage(attack)
+	if stream:
+		# A spitter's attack carries no damage node of its own; the prototype's
+		# damage_modifier is the acid contact damage, and the stream itself
+		# leaves a burning puddle.
+		damage = {"amount": float((attack as Dictionary).get("damage_modifier", 1.0)),
+			"type": "acid"}
 	if damage.is_empty():
 		damage = {"amount": 5.0, "type": "physical"}
 	var amount := float(damage["amount"])
 	var damage_type := str(damage["type"])
 	stats["bites"] = int(stats.get("bites", 0)) + 1
 
+	var hit_at := Vector2(unit["position"])
 	if bool(unit.get("targeting_player", false)) and character != null:
 		character.take_damage(amount, damage_type)
 		stats["player_hits"] = int(stats.get("player_hits", 0)) + 1
-		return true
-	var target: Variant = unit.get("target")
-	if target is Entity and world.entities.has((target as Entity).origin):
-		damage_entity(target as Entity, amount, damage_type, unit)
-		return true
+		hit_at = character.position
+	else:
+		var target: Variant = unit.get("target")
+		if target is Entity and world.entities.has((target as Entity).origin):
+			damage_entity(target as Entity, amount, damage_type, unit)
+			hit_at = (target as Entity).center()
+	if stream:
+		# Contact damage is acid; the puddle is a fifth of it per second and
+		# lasts the 32 seconds Factorio gives it.
+		acid_puddles.append({
+			"position": hit_at, "radius": 1.0,
+			"until": tick + int(32.0 * 60.0),
+			"dps": maxf(1.0, amount * 0.6),
+		})
 	return true
 
 
@@ -2075,6 +2395,7 @@ func _reap_units() -> void:
 		if float(unit.get("health", 0.0)) > 0.0:
 			alive.append(unit)
 		else:
+			_spawn_corpse(unit)
 			stats["units_killed"] = int(stats.get("units_killed", 0)) + 1
 	units = alive
 
@@ -2094,6 +2415,11 @@ func damage_unit(unit: Dictionary, amount: float, damage_type := "physical") -> 
 
 ## Gun turrets track the closest biter in range and shoot on their own clock.
 func _update_turrets() -> void:
+	var alive_shots: Array = []
+	for shot: Dictionary in turret_shots:
+		if tick <= int(shot.get("until", 0)):
+			alive_shots.append(shot)
+	turret_shots = alive_shots
 	for turret: Entity in live_of_type("ammo-turret"):
 		var proto := turret.prototype()
 		var attack: Variant = proto.get("attack_parameters", {})
@@ -2134,6 +2460,15 @@ func _update_turrets() -> void:
 		damage_unit(target, amount, str(damage["type"]))
 		_reap_units()
 		unit_hit.emit(target, amount)
+		turret_shots.append({
+			"from": turret.center(),
+			"to": Vector2(target["position"]),
+			"until": tick + 5,
+		})
+		# The prototype carries its own gunshot variations.
+		var sound: Variant = attack.get("sound")
+		if sound != null:
+			FactorioAudio.play_at(sound, turret.center())
 
 
 func _nearest_unit(from: Vector2, radius: float) -> Dictionary:

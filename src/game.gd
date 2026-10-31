@@ -9,6 +9,9 @@ extends Node2D
 ##   godot --path . -- --screenshot res://tmp_preview/world.png --frames 30
 ##   godot --headless --path . -- --dump-draw res://tmp_preview/draw.json
 
+const ResearchStatusPanelScript := preload(
+	"res://src/ui/research_status_panel.gd")
+
 const TILE := 32.0
 
 var world: GameWorld
@@ -38,6 +41,19 @@ var _chunk_queue: Array[Vector2i] = []
 var _chunk_queued: Dictionary = {}
 var research_window: ResearchWindow
 var minimap: Minimap
+## Guard against the visibility hooks re-entering while we close every window.
+var _closing_windows := false
+## Corpse sheets are huge; decode their textures one per frame while the menu
+## is up instead of blocking or hitching the first firefight.
+var _corpse_texture_queue: Array = []
+var _corpse_texture_seen: Dictionary = {}
+var _corpse_visual_queue: Array = []
+## The current research, between the minimap and the hovered-object panel.
+var research_status: Control
+## The Factorio-style "what am I pointing at" panel under the minimap.
+var entity_info: EntityInfoPanel
+## Set by the ``info`` UI dump so the panel stays on screen for the picture.
+var _info_demo: Entity
 var alert_panel: AlertPanel
 var toolbar: Toolbar
 var tooltips: TooltipLayer
@@ -49,6 +65,10 @@ var settings_window: SettingsWindow
 var game_settings: Dictionary = SettingsWindow.DEFAULTS.duplicate()
 var tutorial_enabled := true
 var save_load_dialog: SaveLoadDialog
+## The file the running factory came from / was last written to.  Empty after
+## a new game, so "Save current" knows there is nothing to overwrite yet.
+var current_save_path := ""
+var current_save_name := ""
 ## Where the save/load dialog was opened from, so Cancel returns there.
 var _save_dialog_context := "pause"
 ## True when the current map was started as a creative world.
@@ -134,6 +154,12 @@ func _ready() -> void:
 		_build_robot_showroom()
 	elif _showroom == "ghosts":
 		_build_ghost_showroom()
+	elif _showroom == "builders":
+		_build_builder_showroom()
+	elif _showroom == "rails":
+		_build_rail_showroom()
+	elif _showroom == "paste":
+		_build_paste_showroom()
 	elif _showroom == "trains":
 		_build_train_showroom()
 	elif _showroom == "rotate":
@@ -190,6 +216,12 @@ func _ready() -> void:
 	_build_hud()
 	_build_ui()
 	_load_settings()
+	if _showroom == "rails":
+		_rail_plan_self_test()
+	if _showroom == "paste":
+		_paste_self_test()
+	if _enemy_demo:
+		_combat_self_test()
 
 	for i in _warmup_ticks:
 		sim.step()
@@ -484,6 +516,11 @@ func _print_report() -> void:
 	print("pollution %.1f total in %d chunks (worst %.1f), evolution %.1f%%" % [
 		float(smog["total"]), int(smog["chunks"]), float(smog["worst"]),
 		sim.evolution * 100.0])
+	print("corpses   %d corpses, %d turret tracers" % [
+		sim.corpses.size(), sim.turret_shots.size()])
+	print("drones    %d builders, %d built, %d ghosts, %d logistic robots" % [
+		sim.logistics.builders.size(), int(sim.logistics.stats().get("built", 0)),
+		world.ghosts().size(), sim.logistics.robots.size()])
 	print("combat    %d biters alive, %d spawned, %d killed, %d bites, %d shots" % [
 		sim.units.size(), int(sim.stats.get("spawned", 0)),
 		int(sim.stats.get("units_killed", 0)), int(sim.stats.get("bites", 0)),
@@ -621,6 +658,7 @@ func _update_music_context() -> void:
 
 
 func _process(delta: float) -> void:
+	_pump_corpse_textures()
 	# Sounds are placed by where the camera is, so follow it every frame.
 	FactorioAudio.listener = camera.position / TILE
 	_update_music_context()
@@ -673,7 +711,10 @@ func _process(delta: float) -> void:
 		objective_panel.visible = not title_screen and tutorial_enabled
 	if weapon_panel != null:
 		weapon_panel.visible = not title_screen and not touch_mode
+	_update_entity_info(not title_screen)
 	if touch_controls != null:
+		if camera != null:
+			touch_controls.tile_pixels = TILE * camera.zoom_level
 		var show_touch := touch_mode and not title_screen and not ui_is_open()
 		touch_controls.visible = show_touch
 		if not show_touch:
@@ -800,6 +841,12 @@ func _build_belt_showroom() -> void:
 			posmod(from + 8, 16))
 		_place("transport-belt", "transport-belt", base + BeltSim.dir_vector(heading),
 			heading)
+	# A belt fed from both sides is a merge, not a turn: it must keep the
+	# straight sprite even though two side belts point into it.
+	var merge_base := origin + Vector2i(2, 4)
+	_place("transport-belt", "transport-belt", merge_base, 4)
+	_place("transport-belt", "transport-belt", merge_base + Vector2i(0, -1), 8)
+	_place("transport-belt", "transport-belt", merge_base + Vector2i(0, 1), 0)
 	# A splitter with two inputs and both outputs, plus an underground pair.
 	var split_base := origin + Vector2i(2, 12)
 	_place("transport-belt", "transport-belt", split_base + Vector2i(-1, 0), 4)
@@ -829,6 +876,21 @@ func _build_belt_showroom() -> void:
 		for lane in 2:
 			BeltSim.items_of(feed).append({"lane": lane, "pos": 0.9,
 				"name": "iron-plate", "count": 1})
+
+	# One entrance must never feed two exits.  Three halves in a row used to
+	# end up as one input plus two outputs, because each new half looked
+	# backwards for any entrance in range; only the nearest pair may form.
+	var shared_base := origin + Vector2i(12, 16)
+	_place("underground-belt", "underground-belt", shared_base, 4)
+	_place("underground-belt", "underground-belt", shared_base + Vector2i(2, 0), 4)
+	_place("underground-belt", "underground-belt", shared_base + Vector2i(4, 0), 4)
+	var halves := world.entities_of_type("underground-belt")
+	var linked := 0
+	for half: Entity in halves:
+		if world.underground_partner(half) != null:
+			linked += 1
+	print("underground: %d halves, %d linked, %d pairs" % [
+		halves.size(), linked, linked / 2])
 
 	_spawn_cell = origin + Vector2i(9, 8)
 	print("belt showroom: %d belts, %d splitters, %d underground" % [
@@ -953,25 +1015,24 @@ func _build_rotate_showroom() -> void:
 ## A length of track with a train standing on it.
 func _build_train_showroom() -> void:
 	var base := _free_cell_near(Vector2i(0, 0))
+	_flatten_showroom(base + Vector2i(-6, -8), Vector2i(70, 20))
+	_spawn_cell = base + Vector2i(18, 2)
 	# A straight track running east.
 	var rails: Array = []
-	for i in 14:
+	for i in 26:
 		var rail := Entity.create("straight-rail", "straight-rail",
-			base + Vector2i(4 * i, 0), 4)
+			base + Vector2i(2 * i, 0), 4)
 		if world.place_entity(rail):
 			rails.append(rail)
 	if rails.size() >= 8:
 		# Two stations, so the train is running to a schedule rather than
 		# just rolling.
-		var alpha := _add_station(base + Vector2i(8, -4), 4, "Iron ore")
-		var beta := _add_station(base + Vector2i(44, -4), 4, "Smelting")
+		var alpha := _add_station(base + Vector2i(8, -2), 4, "Iron ore")
+		var beta := _add_station(base + Vector2i(44, -2), 4, "Smelting")
 		var train := sim.trains.add_train(
 			["locomotive", "cargo-wagon", "cargo-wagon"], rails[2], 4)
 		train["schedule"] = ["Iron ore", "Smelting"]
 		train["automatic"] = true
-		train["schedule_index"] = 1
-		for i in 90:
-			sim.step()
 		print("train showroom: stations at %s and %s" % [alpha, beta])
 	_spawn_cell = base + Vector2i(24, 10)
 	print("train showroom: %d rails, %d trains" % [
@@ -1005,15 +1066,21 @@ func _build_ghost_showroom() -> void:
 		yard + Vector2i(0, 5), 0)
 	world.place_entity(store)
 	var storage := InventoryLayout.get_inventory(store, InventoryLayout.STORAGE)
-	for item: Array in [["stone", 200], ["iron-plate", 200],
+	if storage != null:
+		for item: Array in [["stone", 200], ["iron-plate", 200],
 			["iron-gear-wheel", 200], ["transport-belt", 200],
 			["stone-furnace", 20], ["burner-mining-drill", 20],
 			["small-electric-pole", 50], ["solar-panel", 50]]:
-		storage.insert(str(item[0]), int(item[1]))
+			storage.insert(str(item[0]), int(item[1]))
 	# The personal roboport answers to the engineer, so the network needs a
 	# handle on them.
 	sim.logistics.player = player
 	sim.logistics.mark_dirty()
+	for i in 600:
+		sim.step()
+	var left := world.ghosts().size()
+	print("ghost build test: %d ghosts left, %d built by robots" % [
+		left, sim.logistics._built])
 	print("ghost showroom: copied %d, pasted %d ghosts, roboport at %s" % [
 		(blueprint["entities"] as Array).size(),
 		(result["ghosts"] as Array).size(), yard])
@@ -1036,6 +1103,144 @@ func _build_robot_showroom() -> void:
 	sim.logistics.mark_dirty()
 	# Fly for a while, then stop mid-errand so the picture has robots in it.
 	print("robot showroom: %d robots" % sim.logistics.robots.size())
+
+
+## A small staging area for the Ctrl+V / shift-paste test.
+func _build_paste_showroom() -> void:
+	_spawn_cell = _free_cell_near(Vector2i(0, 0))
+
+
+func _paste_self_test() -> void:
+	var base := _free_cell_near(_spawn_cell + Vector2i(8, 0))
+	_flatten_showroom(base + Vector2i(-2, -4), Vector2i(18, 10))
+	var sample := Entity.create("transport-belt", "transport-belt", base, 0)
+	world.place_entity(sample)
+	player._clipboard_blueprint = Blueprints.capture(world,
+		Rect2i(base, Vector2i(1, 1)))
+	var target := base + Vector2i(6, 0)
+	var old := Entity.create("container", "wooden-chest", target, 0)
+	world.place_entity(old)
+	var port: Entity = null
+	var port_cell := base
+	for dy in range(-12, 13):
+		for dx in range(-12, 13):
+			var candidate_cell := base + Vector2i(dx, dy)
+			var candidate := Entity.create("roboport", "roboport",
+				candidate_cell, 0)
+			if world.can_place_terrain(candidate) and world.can_place(candidate):
+				if world.place_entity(candidate):
+					port = candidate
+					port_cell = candidate_cell
+					break
+		if port != null:
+			break
+	var store := Entity.create("logistic-container", "storage-chest",
+		port_cell + Vector2i(4, 0), 0)
+	var store_ok := world.place_entity(store)
+	print("paste test: port=%s at %s store=%s" % [port != null, port_cell,
+		store_ok])
+	var storage := InventoryLayout.get_inventory(store, InventoryLayout.STORAGE)
+	if storage != null:
+		storage.insert("transport-belt", 50)
+	sim.logistics.mark_dirty()
+	player.hover_cell = target
+	player.hover_valid = true
+	player.begin_paste()
+	player._rebuild_paste()
+	print("paste test: %d ghosts, %d blockers" % [
+		player._paste_entities.size(), player._paste_blockers.size()])
+	player._commit_paste(true)
+	print("paste test: %d deconstruction orders, %d ghosts after commit" % [
+		sim.logistics.deconstruction.size(), world.ghosts().size()])
+	for i in 900:
+		sim.step()
+	var result := world.entity_at(target)
+	print("paste test: target is %s / %s, orders=%d built=%d" % [
+		result.proto_type if result != null else "nothing",
+		result.name if result != null else "", sim.logistics.deconstruction.size(),
+		int(sim.logistics.stats().get("built", 0))])
+
+
+## One rail and a place to plan from, so the drag planner can be exercised.
+func _build_rail_showroom() -> void:
+	var base := _free_cell_near(Vector2i(0, 0)) + Vector2i(6, 0)
+	_flatten_showroom(base + Vector2i(-4, -4), Vector2i(24, 20))
+	_spawn_cell = base + Vector2i(0, 6)
+	var rail := Entity.create("straight-rail", "straight-rail", base, 0)
+	world.place_entity(rail)
+	print("rail showroom: anchor at %s path=%s" % [base,
+		RailGeometry.path_of(rail)])
+
+
+func _rail_plan_self_test() -> void:
+	if player == null:
+		return
+	player.inventory.insert("rail", 80)
+	player.quickbar[0] = "rail"
+	player.selected_slot = 0
+	player.hover_cell = _spawn_cell + Vector2i(26, -3)
+	player.hover_valid = true
+	player._rail_planning = true
+	player._rail_anchor = world.entity_at(_spawn_cell + Vector2i(-6, -6))
+	if player._rail_anchor == null:
+		# The showroom's rail is at the flat area's north-west corner.
+		for entity: Entity in world.entities.values():
+			if entity.proto_type == "straight-rail":
+				player._rail_anchor = entity
+				break
+	player._tick_rail_plan()
+	var last_end := Vector2.ZERO
+	if not player._rail_plan.is_empty():
+		var path := RailGeometry.path_of(player._rail_plan.back())
+		last_end = Vector2(path["end"])
+	var continuous := true
+	var previous := RailGeometry.path_of(player._rail_anchor)
+	for piece: Entity in player._rail_plan:
+		var p := RailGeometry.path_of(piece)
+		if previous.is_empty() or p.is_empty() \
+				or Vector2(p["start"]).distance_to(Vector2(previous["end"])) > 0.05 \
+				or int(p["start_dir"]) != int(previous["end_dir"]):
+			continuous = false
+			break
+		previous = p
+	var planned := player._rail_plan.size()
+	player._commit_rail_plan("rail")
+	var placed_rails := world.entities_of_type("straight-rail").size() \
+		+ world.entities_of_type("curved-rail-a").size() \
+		+ world.entities_of_type("curved-rail-b").size()
+	print("rail planner test: %d pieces, end=%s target=%s continuous=%s placed=%d" % [
+		planned, last_end, Vector2(player.hover_cell) + Vector2(0.5, 0.5),
+		continuous, placed_rails])
+
+
+## Regression: construction robots must take materials from a storage chest
+## in the roboport's logistics network, not only from providers or the player.
+func _build_builder_showroom() -> void:
+	var base := _free_cell_near(Vector2i(0, 0)) + Vector2i(8, 0)
+	_flatten_showroom(base + Vector2i(-4, -4), Vector2i(46, 10))
+	_spawn_cell = base + Vector2i(0, 4)
+	var port := Entity.create("roboport", "roboport", base, 0)
+	var port_ok := world.place_entity(port)
+	var store := Entity.create("logistic-container", "passive-provider-chest",
+		base + Vector2i(27, 0), 0)
+	var store_ok := world.place_entity(store)
+	var storage := InventoryLayout.get_inventory(store, InventoryLayout.STORAGE)
+	if storage != null:
+		storage.insert("wood", 50)
+		storage.insert("iron-plate", 50)
+	var plan := Entity.create("container", "wooden-chest", base + Vector2i(31, 0), 0)
+	var placed := world.place_ghost(plan)
+	sim.logistics.mark_dirty()
+	for i in 4000:
+		sim.step()
+	var built := world.entity_at(plan.origin)
+	var states: Array = []
+	for robot: Dictionary in sim.logistics.builders:
+		states.append(str(robot.get("state", "")))
+	print("builder storage test: port=%s store=%s ghost=%s built=%s wood=%d sources=%d builders=%s" % [
+		port_ok, store_ok, placed, built != null and not built.is_ghost(),
+		storage.count_of("wood") if storage != null else -1,
+		sim.logistics.builder_sources(port, plan.origin).size(), states])
 
 
 ## One of every pipe connection shape, laid out for visual inspection.
@@ -1067,6 +1272,25 @@ func _build_pipe_showroom() -> void:
 	_place("pipe", "pipe", base + Vector2i(19, 4), 0)
 	# one lonely pipe
 	_place("pipe", "pipe", base + Vector2i(23, 3), 0)
+	# A pipe-to-ground pair with a three-tile gap: the two halves must face
+	# opposite ways and meet in the fluid graph even though they are not
+	# neighbours in the entity grid.
+	# Keep the pair visible and clear of the showroom's decorative trees.
+	_flatten_showroom(base + Vector2i(5, -5), Vector2i(6, 8))
+	var underground_base := base + Vector2i(7, -3)
+	_place("pipe-to-ground", "pipe-to-ground",
+		underground_base + Vector2i(0, 3), 8)
+	_place("pipe-to-ground", "pipe-to-ground", underground_base, 0)
+	_place("pipe", "pipe", underground_base + Vector2i(0, -1), 0)
+	_place("pipe", "pipe", underground_base + Vector2i(0, 4), 0)
+	var pipe_in := world.entity_at(underground_base)
+	var pipe_out := world.entity_at(underground_base + Vector2i(0, 3))
+	print("pipe-to-ground link: %s" % [
+		sim.fluids.underground_pipe_partner(world, pipe_in) == pipe_out])
+	if pipe_in != null and pipe_out != null:
+		print("pipe-to-ground network sizes: %d / %d" % [
+			sim.fluids.network_size(pipe_in, FluidSystem.PRIMARY),
+			sim.fluids.network_size(pipe_out, FluidSystem.PRIMARY)])
 	print("pipe showroom: %d pipes" % world.entities_of_type("pipe").size())
 
 
@@ -1297,6 +1521,21 @@ func _build_ui() -> void:
 	minimap.tile_clicked.connect(_on_minimap_clicked)
 	ui_root.add_child(minimap)
 
+	# Factorio's right-hand column: minimap, current research, then the
+	# hovered object's details.
+	research_status = ResearchStatusPanelScript.new(research)
+	research_status.name = "ResearchStatus"
+	research_status.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	research_status.position = Vector2(-248 - 8, minimap.VIEW_TILES.y + 14)
+	ui_root.add_child(research_status)
+
+	entity_info = EntityInfoPanel.new(world, sim, player)
+	entity_info.name = "EntityInfo"
+	entity_info.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	entity_info.position = Vector2(-EntityInfoPanel.WIDTH - 8,
+		minimap.VIEW_TILES.y + 14 + 80 + 8)
+	ui_root.add_child(entity_info)
+
 	alert_panel = AlertPanel.new()
 	alert_panel.name = "AlertPanel"
 	alert_panel.alerts = sim.alerts
@@ -1361,6 +1600,15 @@ func _build_ui() -> void:
 	map_window.view_requested.connect(_on_map_view_requested)
 	ui_root.add_child(map_window)
 
+	# Any one of these windows closing (Esc or its Close button) should take
+	# the rest of the stack with it: a machine window and the character
+	# inventory are one screen, not two.
+	for window: Variant in [inventory_window, entity_window, equipment_window,
+			map_window, production_window, research_window]:
+		if window is Control:
+			(window as Control).visibility_changed.connect(
+				_on_game_window_visibility_changed.bind(window as Control))
+
 	# One chunk-picture cache for both maps: opening the map after the minimap
 	# has already rasterised the nearby chunks costs a few blits, not another
 	# round of chunk building.
@@ -1402,9 +1650,17 @@ func _build_ui() -> void:
 func _build_touch_controls() -> void:
 	if not touch_mode:
 		return
+	# The touch HUD is its own layer above the minimap/windows (which are on
+	# layer 3).  Otherwise the minimap covers the open MORE panel, which was
+	# especially obvious on a phone.
+	var layer := CanvasLayer.new()
+	layer.name = "TouchLayer"
+	layer.layer = 4
+	add_child(layer)
 	touch_controls = TouchControls.new()
 	touch_controls.name = "TouchControls"
-	hud.add_child(touch_controls)
+	touch_controls.ui_scale = _touch_ui_scale()
+	layer.add_child(touch_controls)
 	touch_controls.move_changed.connect(_on_touch_move)
 	touch_controls.pointer_changed.connect(_on_touch_pointer)
 	touch_controls.action.connect(_on_touch_action)
@@ -1413,6 +1669,19 @@ func _build_touch_controls() -> void:
 	player.touch_ui_check = _touch_ui_blocks
 	player.set_virtual_pointer(touch_controls.pointer_position())
 	_apply_touch_layout()
+
+
+## Touch buttons were authored for 1600x900 logical units.  High-density
+## phones report a larger display scale/DPI, so nudge them up without making
+## the controls huge on a tablet.
+func _touch_ui_scale() -> float:
+	var scale := 1.0
+	if DisplayServer.get_name() != "headless":
+		scale = maxf(scale, DisplayServer.screen_get_scale())
+		var dpi := float(DisplayServer.screen_get_dpi())
+		if dpi > 0.0:
+			scale = maxf(scale, dpi / 300.0)
+	return clampf(scale, 1.0, 1.35)
 
 
 func _on_touch_move(direction: Vector2) -> void:
@@ -1630,6 +1899,64 @@ func _layout_side_windows() -> void:
 		inventory_window._refresh_cursor()
 
 
+## Escape (and the Close button) closes the whole window stack at once.
+func _input(event: InputEvent) -> void:
+	if not (event is InputEventKey):
+		return
+	var key := event as InputEventKey
+	if not key.pressed or key.echo or key.keycode != KEY_ESCAPE:
+		return
+	if _modal_menu_open():
+		return
+	if _any_game_window_open():
+		close_all_windows()
+		get_viewport().set_input_as_handled()
+
+
+func _modal_menu_open() -> bool:
+	return (settings_window != null and settings_window.visible) \
+		or (save_load_dialog != null and save_load_dialog.visible) \
+		or (world_settings_dialog != null and world_settings_dialog.visible) \
+		or (pause_menu != null and pause_menu.visible)
+
+
+func _any_game_window_open() -> bool:
+	for window: Variant in [inventory_window, entity_window, equipment_window,
+			map_window, production_window, research_window]:
+		if window is Control and (window as Control).visible:
+			return true
+	return player != null and player.item_picker != null \
+		and player.item_picker.visible
+
+
+func close_all_windows() -> void:
+	if _closing_windows:
+		return
+	_closing_windows = true
+	if inventory_window != null:
+		inventory_window.close_window()
+	if entity_window != null:
+		entity_window.close_window()
+	if equipment_window != null:
+		equipment_window.close_window()
+	if map_window != null:
+		map_window.close_window()
+	if production_window != null:
+		production_window.close_window()
+	if research_window != null:
+		research_window.close_window()
+	if player != null and player.item_picker != null:
+		player.item_picker.close_picker()
+	_closing_windows = false
+
+
+func _on_game_window_visibility_changed(window: Control) -> void:
+	if _closing_windows or window.visible:
+		return
+	if _any_game_window_open():
+		close_all_windows()
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	if not (event is InputEventKey) or not event.pressed or event.echo:
 		return
@@ -1656,6 +1983,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			renderer.show_alt = not renderer.show_alt
 			toolbar.set_alt(renderer.show_alt)
 		KEY_C, KEY_SPACE:
+			if key.ctrl_pressed:
+				return
 			player.shoot_at(camera.mouse_world_position())
 		KEY_HOME:
 			# Clicking the map lets the camera go, and without this there is no
@@ -1706,6 +2035,8 @@ func save_game(save_name := "Quicksave") -> bool:
 	if path.is_empty():
 		push_warning("could not write save %s" % save_name)
 		return false
+	current_save_path = path
+	current_save_name = str(data.get("save_name", save_name))
 	var bytes := FileAccess.get_file_as_string(path).length()
 	print("saved '%s' (%d entities, %d chunks, tick %d, %.1f kB)" % [
 		save_name, world.entities.size(), world.chunk_count(), sim.tick,
@@ -1739,6 +2070,14 @@ func load_game(path := "") -> bool:
 		player.creative = creative
 		player.driving = null
 	sim.tick = int(data.get("tick", 0))
+	# Saves made with the old 14-chunk start ring contain no nests at all in
+	# their explored area; shrink the ring so the seeding below can find room.
+	if world.entities_of_type("unit-spawner").is_empty() \
+			and sim.enemy_safe_chunks > 5:
+		sim.enemy_safe_chunks = 5
+	var seeded := sim.seed_enemy_nests()
+	if seeded > 0:
+		print("enemy nests seeded for this save: %d" % seeded)
 	if sim.alerts != null:
 		sim.alerts.reset()
 	player.research = research
@@ -1758,9 +2097,13 @@ func load_game(path := "") -> bool:
 	inventory_window.close_window()
 	research_window.close_window()
 	_preload_visuals()
+	current_save_path = path
+	current_save_name = str(data.get("save_name", ""))
+	if current_save_name.is_empty():
+		current_save_name = path.get_file().get_basename()
 	_save_flash = 3.0
 	print("loaded '%s' (%d entities, %d chunks, tick %d)" % [
-		str(data.get("save_name", path.get_file())), world.entities.size(),
+		current_save_name, world.entities.size(),
 		world.chunk_count(), sim.tick])
 	return true
 
@@ -1772,7 +2115,8 @@ func _open_save_dialog() -> void:
 	if save_load_dialog != null:
 		save_load_dialog.move_to_front()
 		save_load_dialog.open_save("Factory " + Time.get_datetime_string_from_system()
-			.replace("T", " ").replace(":", "-"))
+			.replace("T", " ").replace(":", "-"),
+			current_save_name, current_save_path)
 
 
 func _open_load_dialog() -> void:
@@ -1805,6 +2149,12 @@ func _save_named(save_name: String) -> void:
 
 func _load_named(path: String) -> void:
 	load_game(path)
+
+
+func _on_save_deleted(path: String) -> void:
+	if path == current_save_path:
+		current_save_path = ""
+		current_save_name = ""
 ## A goal was met: tell the player and chime.
 func _on_objective_completed(_index: int, title: String) -> void:
 	if not tutorial_enabled:
@@ -1928,6 +2278,7 @@ func _build_menus() -> void:
 	save_load_dialog.name = "SaveLoad"
 	save_load_dialog.save_requested.connect(_save_named)
 	save_load_dialog.load_requested.connect(_load_named)
+	save_load_dialog.save_deleted.connect(_on_save_deleted)
 	save_load_dialog.cancelled.connect(_cancel_save_dialog)
 	save_load_dialog.z_index = 100
 	ui_root.add_child(save_load_dialog)
@@ -1964,12 +2315,121 @@ func _on_settings_changed(values: Dictionary) -> void:
 ## Headless runs draw nothing, and phones have little enough memory that the
 ## lazy path is safer there.
 func _preload_visuals() -> void:
+	_prewarm_combat_assets()
 	if renderer == null or DisplayServer.get_name() == "headless" \
 			or OS.has_feature("mobile"):
 		return
-	renderer.preload_ground_images()
-	if character != null:
-		renderer.prewarm_entity_visuals(Vector2i(character.position), 2)
+	# Browsers have a much smaller address space than desktop.  Preloading
+	# every ground sheet here costs gigabytes of decoded RGBA images and is
+	# the reason the Web build ran out of memory when a world started.  Let
+	# the chunk baker decode only the ground tiles it actually needs instead.
+	if not OS.has_feature("web"):
+		renderer.preload_ground_images()
+		if character != null:
+			renderer.prewarm_entity_visuals(Vector2i(character.position), 2)
+
+
+## Decode gunshot streams and turret direction sheets before the first shot.
+##
+## Both used to be lazy: the first shot in a firefight paid for Ogg decoding
+## and a 500 kB sprite sheet in one frame, which read as a freeze while the
+## turret was firing.
+func _prewarm_combat_assets() -> void:
+	for gun_name: String in ["pistol", "submachine-gun", "shotgun",
+			"combat-shotgun", "rocket-launcher"]:
+		var gun := Prototypes.get_p("gun", gun_name)
+		if not gun.is_empty():
+			FactorioAudio.prewarm((gun.get("attack_parameters", {}) as Dictionary).get("sound"))
+	for turret_name: String in ["gun-turret", "shotgun-turret",
+			"laser-turret", "artillery-turret"]:
+		var turret := Prototypes.get_p("ammo-turret", turret_name)
+		if turret.is_empty():
+			turret = Prototypes.get_p("electric-turret", turret_name)
+		if turret.is_empty():
+			continue
+		FactorioAudio.prewarm((turret.get("attack_parameters", {}) as Dictionary).get("sound"))
+	if OS.has_feature("mobile"):
+		return
+	# Web has a much tighter memory budget; preloading the turret sheets and
+	# every corpse death/decay texture here exhausted it before the world
+	# even finished loading.  Audio is cheap; graphics stay lazy.
+	if OS.has_feature("web"):
+		return
+	var gun_turret := Prototypes.get_p("ammo-turret", "gun-turret")
+	if gun_turret.is_empty():
+		return
+	var gs: Variant = gun_turret.get("graphics_set", {})
+	if gs is Dictionary and gs.has("base_visualisation"):
+		var base_vis: Variant = gs["base_visualisation"]
+		SpriteCache.layers(base_vis, 0, 0, 0, "prewarm/turret-base")
+	var gun_anim: Variant = gun_turret.get("prepared_animation")
+	if gun_anim != null:
+		# 64 directions, four stripe files: resolving a spread of directions
+		# loads every file before the first target appears.
+		for direction in range(0, 64, 4):
+			SpriteCache.layers(gun_anim, direction, 0, 0, "prewarm/turret-gun")
+	# Queue the corpse body textures, one decode per frame.
+	for corpse_name: String in ["small-biter-corpse", "small-spitter-corpse"]:
+		var corpse_proto := Prototypes.get_p("corpse", corpse_name)
+		if corpse_proto.is_empty():
+			continue
+		for key: String in ["animation", "decay_animation"]:
+			var node: Variant = corpse_proto.get(key)
+			_queue_corpse_node(node)
+			if node != null:
+				var stage := "death" if key == "animation" else "decay"
+				# This must match WorldRenderer._emit_corpses' tag exactly,
+				# otherwise the entries land in a different cache bucket.
+				var tag := "corpse/%s/%s" % [corpse_name, stage]
+				for direction in [0, 4, 8, 12]:
+					for frame in [0, 8, 16, 24]:
+						_corpse_visual_queue.append({"node": node,
+							"direction": direction, "frame": frame,
+							"tag": tag})
+
+
+func _queue_corpse_node(node: Variant) -> void:
+	if node == null:
+		return
+	if node is String:
+		var path := str(node)
+		if not path.is_empty() and not _corpse_texture_seen.has(path):
+			_corpse_texture_seen[path] = true
+			_corpse_texture_queue.append(path)
+		return
+	if node is Array:
+		for entry: Variant in node:
+			_queue_corpse_node(entry)
+		return
+	if not (node is Dictionary):
+		return
+	var dict: Dictionary = node
+	if bool(dict.get("draw_as_shadow", false)) \
+			or bool(dict.get("apply_runtime_tint", false)):
+		return
+	if dict.has("stripes"):
+		_queue_corpse_node(dict["stripes"])
+	if dict.has("filenames"):
+		_queue_corpse_node(dict["filenames"])
+	if dict.has("filename"):
+		var path := str(dict["filename"])
+		if not path.is_empty() and not _corpse_texture_seen.has(path):
+			_corpse_texture_seen[path] = true
+			_corpse_texture_queue.append(path)
+	if dict.has("layers"):
+		_queue_corpse_node(dict["layers"])
+
+
+func _pump_corpse_textures() -> void:
+	if not _corpse_texture_queue.is_empty():
+		var path: Variant = _corpse_texture_queue.pop_front()
+		FactorioAssets.texture(str(path))
+		return
+	if _corpse_visual_queue.is_empty():
+		return
+	var task: Dictionary = _corpse_visual_queue.pop_front()
+	SpriteCache.layers(task["node"], int(task["direction"]),
+		int(task["frame"]), 0, str(task["tag"]))
 
 
 func _load_settings() -> void:
@@ -2141,6 +2601,8 @@ func _start_new_game(settings: Dictionary = {}) -> void:
 	if not main_menu.visible and not pause_menu.visible and not from_world_settings:
 		return
 	sim.paused = false
+	current_save_path = ""
+	current_save_name = ""
 	main_menu.close_menu()
 	pause_menu.close_menu()
 	if world_settings_dialog != null:
@@ -2162,7 +2624,7 @@ func _start_new_game(settings: Dictionary = {}) -> void:
 		player.driving = null
 	sim.evolution_speed = float(settings.get("evolution_speed", 1.0))
 	sim.enemy_safe_chunks = clampi(int(round(float(settings.get(
-		"nest_distance", 14.0)))), 0, 60)
+		"nest_distance", 5.0)))), 0, 60)
 	sim.enemy_safe_center = Vector2i.ZERO
 	sim.tick = 0
 	if sim.alerts != null:
@@ -2171,6 +2633,8 @@ func _start_new_game(settings: Dictionary = {}) -> void:
 	sim._elapsed_seconds = 0.0
 	sim._pollution_produced = 0.0
 	sim.units.clear()
+	sim.corpses.clear()
+	sim.acid_puddles.clear()
 	sim.pollution.clear()
 	sim.logistics.clear()
 	sim.reset_stats()
@@ -2253,6 +2717,29 @@ func ui_is_open() -> bool:
 		or (settings_window != null and settings_window.visible)
 
 
+## Feed the right-hand info panel whatever the cursor is resting on.
+##
+## Hovering is only meaningful when the world has the pointer: a modal window
+## or the title screen must not leave a stale panel behind.
+func _update_entity_info(enabled: bool) -> void:
+	if entity_info == null:
+		return
+	var target: Entity = null
+	if _info_demo != null and is_instance_valid(_info_demo):
+		target = _info_demo
+	elif enabled and player != null and player.hover_valid \
+			and not player.input_blocked:
+		target = world.entity_at(player.hover_cell)
+		if target == null:
+			# Bare ground: if it is an ore tile, Factorio still names the
+			# resource and how much of it is left.
+			var ore := world.ore_at(player.hover_cell)
+			if not str(ore["name"]).is_empty() and float(ore["amount"]) > 0.0:
+				entity_info.refresh_ore(str(ore["name"]), float(ore["amount"]))
+				return
+	entity_info.refresh(target)
+
+
 # --------------------------------------------------------------------------
 # HUD
 # --------------------------------------------------------------------------
@@ -2333,7 +2820,7 @@ func _health_line() -> String:
 	var gun := player.selected_gun() if player != null else ""
 	if not gun.is_empty():
 		var ammo := player.ammo_for(gun)
-		line += "   %s%s" % [Loc.proto_name("gun", gun),
+		line += "   %s%s   [C/Space: fire]" % [Loc.proto_name("gun", gun),
 			" x%d" % player.inventory.count_of(ammo) if not ammo.is_empty() else " (no ammo)"]
 	return line
 
@@ -2382,6 +2869,28 @@ func _save_line() -> String:
 	return "F5 saved / F9 loaded"
 
 
+## Check the engineer's gun against a biter and a spitter, independent of
+## the turret test inside the enemy demo.
+func _combat_self_test() -> void:
+	if player == null or character == null or sim == null:
+		return
+	var biter := sim.spawn_unit("small-biter", character.position + Vector2(4, 0))
+	var spitter := sim.spawn_unit("small-spitter", character.position + Vector2(-4, 0))
+	var start_units := sim.units.size()
+	var start_ammo := player.inventory.count_of("firearm-magazine")
+	for i in 40:
+		if biter not in sim.units and spitter not in sim.units:
+			break
+		character.fire_cooldown = 0
+		var aim := Vector2(spitter.get("position", character.position)) * TILE
+		if biter in sim.units:
+			aim = Vector2(biter.get("position", character.position)) * TILE
+		player.shoot_at(aim)
+	print("combat test: %d -> %d units, %d magazines used" % [
+		start_units, sim.units.size(), start_ammo - player.inventory.count_of(
+			"firearm-magazine")])
+
+
 ## A nest and a turret, so the biters have somewhere to come from and
 ## something to run into.
 func _build_enemy_demo() -> void:
@@ -2392,16 +2901,30 @@ func _build_enemy_demo() -> void:
 	# A turret watching the line, with a magazine.
 	var turret_cell := _free_cell_near(_spawn_cell + Vector2i(-6, 6))
 	var turret := Entity.create("ammo-turret", "gun-turret", turret_cell, 0)
-	world.place_entity(turret)
-	InventoryLayout.get_inventory(turret, InventoryLayout.FUEL).insert(
-		"firearm-magazine", 20)
+	if world.place_entity(turret):
+		var magazine := InventoryLayout.get_inventory(turret,
+			InventoryLayout.FUEL)
+		if magazine != null:
+			magazine.insert("firearm-magazine", 20)
 	# Give the nest something to smell.
 	for i in 40:
 		sim.pollution.add(nest_cell, 900.0)
 	sim.fluids.mark_dirty()
 	sim.mark_power_dirty()
-	print("enemy demo: %d nests, turret at %s" % [
-		world.entities_of_type("unit-spawner").size(), turret_cell])
+	# Combat check: a few biters close enough for the turret to engage.
+	for i in 3:
+		sim.spawn_unit("small-biter", Vector2(turret_cell) + Vector2(5 + i, 0))
+		sim.spawn_unit("small-spitter", Vector2(turret_cell) + Vector2(-5 - i, 0))
+	for i in 300:
+		sim.step()
+	var spitters := 0
+	for unit: Dictionary in sim.units:
+		if "spitter" in str(unit.get("name", "")):
+			spitters += 1
+	print("enemy demo: %d nests, turret at %s, %d shots, %d units (%d spitters), %d puddles, turret hp=%.0f" % [
+		world.entities_of_type("unit-spawner").size(), turret_cell,
+		int(turret.state.get("shots", 0)), sim.units.size(), spitters,
+		sim.acid_puddles.size(), float(turret.state.get("health", 0.0))])
 
 
 ## The in-game menu over a working factory, for the UI dump.
@@ -2442,6 +2965,25 @@ func _build_alert_demo() -> void:
 		sim.step()
 	alert_panel.refresh()
 	print("alert demo: %d alerts" % sim.alerts.total())
+
+
+## A stone furnace with ore, coal and a full output, for the info-panel dump.
+func _spawn_furnace_demo() -> Entity:
+	var base := _free_cell_near(_spawn_cell + Vector2i(0, 6))
+	_flatten_showroom(base + Vector2i(-2, -2), Vector2i(6, 6))
+	var furnace := Entity.create("furnace", "stone-furnace", base, 0)
+	if not world.place_entity(furnace):
+		return null
+	var input := InventoryLayout.get_inventory(furnace, InventoryLayout.INPUT)
+	if input != null:
+		input.insert("iron-ore", 8)
+	var fuel := InventoryLayout.get_inventory(furnace, InventoryLayout.FUEL)
+	if fuel != null:
+		fuel.insert("coal", 5)
+	var output := InventoryLayout.get_inventory(furnace, InventoryLayout.OUTPUT)
+	if output != null:
+		output.insert("iron-plate", 100)
+	return furnace
 
 
 ## Drop an assembling machine in a free spot near the engineer, for the UI
@@ -2633,6 +3175,8 @@ func _dump_ui_tree() -> void:
 				push_warning("no room for an assembling machine")
 		"mainmenu":
 			main_menu.open(true, "Factorio 2.0.77 data")
+		"saves":
+			_open_save_dialog()
 		"pause":
 			_pause_demo()
 		"objectives":
@@ -2673,6 +3217,31 @@ func _dump_ui_tree() -> void:
 		"alerts":
 			_build_alert_demo()
 			alert_panel.refresh()
+		"ghost":
+			# A ghost's own window: recipe picker and requests must work
+			# before the machine exists.
+			var ghost_cell := _free_cell_near(_spawn_cell + Vector2i(0, 6))
+			_flatten_showroom(ghost_cell + Vector2i(-1, -1), Vector2i(3, 3))
+			var ghost := Entity.create("assembling-machine",
+				"assembling-machine-1", ghost_cell, 0)
+			if world.place_ghost(ghost):
+				ghost.state["recipe"] = "iron-gear-wheel"
+				entity_window.open_window(ghost)
+				inventory_window.open_window()
+		"drill":
+			var drills := world.entities_of_type("mining-drill")
+			if not drills.is_empty():
+				_info_demo = drills[0]
+				entity_info.refresh(_info_demo)
+		"info":
+			# The hover panel: a stone furnace holding ore, fuel and a full
+			# output, so the dump shows every row it can produce.
+			var demo := _spawn_furnace_demo()
+			if demo != null:
+				for i in 4:
+					sim.step()
+				_info_demo = demo
+				entity_info.refresh(demo)
 		"research":
 			# Give the tree something to show.
 			research.on_item_produced("iron-plate", 50)

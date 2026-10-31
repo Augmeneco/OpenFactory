@@ -20,7 +20,9 @@ const JOYSTICK := 232.0
 const AIM_JOYSTICK := 188.0
 const MOUSE_W := 88.0
 const MOUSE_H := 64.0
-const POINTER_SPEED := 430.0
+## One pointer step is one screen tile at the current camera zoom.
+const POINTER_REPEAT := 0.14
+const POINTER_FIRST_DELAY := 0.34
 
 var _joystick: TouchJoystick
 var _aim_joystick: TouchJoystick
@@ -30,6 +32,13 @@ var _more_open := false
 var _pointer := Vector2.ZERO
 var _pointer_ready := false
 var _pointer_visible := false
+## DPI / display scale for the whole touch HUD.  The layout is authored at
+## 1600x900 logical units, so a high-density phone needs a little more.
+var ui_scale := 1.0
+## Screen pixels per world tile, updated by Game as the camera zooms.
+var tile_pixels := 32.0
+var _step_direction := Vector2.ZERO
+var _step_delay := 0.0
 var _move_label: Label
 var _aim_label: Label
 
@@ -49,6 +58,8 @@ func _ready() -> void:
 	_aim_joystick.name = "TouchAimJoystick"
 	_aim_joystick.moved.connect(_on_aim_moved)
 	add_child(_aim_joystick)
+	_joystick.ui_scale = ui_scale
+	_aim_joystick.ui_scale = ui_scale
 	_move_label = _make_joystick_label("MOVE")
 	_aim_label = _make_joystick_label("AIM")
 
@@ -72,17 +83,17 @@ func _make_joystick_label(text: String) -> Label:
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	label.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	label.add_theme_font_override("font", FactorioStyle.font("default"))
-	label.add_theme_font_size_override("font_size", 12)
+	label.add_theme_font_size_override("font_size", roundi(12.0 * ui_scale))
 	label.add_theme_color_override("font_color", Color(0.88, 0.83, 0.66, 0.9))
 	label.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
-	label.add_theme_constant_override("outline_size", 3)
+	label.add_theme_constant_override("outline_size", roundi(3.0 * ui_scale))
 	add_child(label)
 	return label
 
 
 func _add_direct(key: String, label: String, action_name: String,
 		accent := false) -> void:
-	var button := _make_button(label, BUTTON, accent)
+	var button := _make_button(label, BUTTON * ui_scale, accent)
 	button.name = "Touch" + key.capitalize()
 	button.pressed.connect(_on_direct.bind(key, action_name))
 	add_child(button)
@@ -91,11 +102,11 @@ func _add_direct(key: String, label: String, action_name: String,
 
 func _add_mouse_button(key: String, label: String, action_name: String,
 		accent: bool) -> void:
-	var button := _make_button(label, MOUSE_H, accent)
+	var button := _make_button(label, MOUSE_H * ui_scale, accent)
 	button.name = "Touch" + key.capitalize()
-	button.custom_minimum_size = Vector2(MOUSE_W, MOUSE_H)
-	button.size = Vector2(MOUSE_W, MOUSE_H)
-	button.add_theme_font_size_override("font_size", 17)
+	button.custom_minimum_size = Vector2(MOUSE_W * ui_scale, MOUSE_H * ui_scale)
+	button.size = Vector2(MOUSE_W * ui_scale, MOUSE_H * ui_scale)
+	button.add_theme_font_size_override("font_size", roundi(17.0 * ui_scale))
 	if key == "rmb":
 		button.button_down.connect(func() -> void:
 			_pointer_visible = true
@@ -150,10 +161,10 @@ func _build_more() -> void:
 	var title := Label.new()
 	title.text = "MORE  •  tap = build, double tap = open, hold = mine"
 	title.add_theme_font_override("font", FactorioStyle.font("default"))
-	title.add_theme_font_size_override("font_size", 12)
+	title.add_theme_font_size_override("font_size", roundi(12.0 * ui_scale))
 	title.add_theme_color_override("font_color", Color(0.78, 0.76, 0.68))
 	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	title.custom_minimum_size = Vector2(332, 0)
+	title.custom_minimum_size = Vector2(332.0 * ui_scale, 0)
 	column.add_child(title)
 
 	var grid := GridContainer.new()
@@ -170,12 +181,12 @@ func _build_more() -> void:
 		["−", "zoom_out"],
 	]
 	for entry: Array in entries:
-		var button := _make_button(str(entry[0]), 58.0)
-		button.custom_minimum_size = Vector2(86, 58)
-		button.size = Vector2(86, 58)
+		var button := _make_button(str(entry[0]), 58.0 * ui_scale)
+		button.custom_minimum_size = Vector2(86.0 * ui_scale, 58.0 * ui_scale)
+		button.size = Vector2(86.0 * ui_scale, 58.0 * ui_scale)
 		button.pressed.connect(_on_more_action.bind(str(entry[1])))
 		grid.add_child(button)
-	_more.custom_minimum_size = Vector2(382, 372)
+	_more.custom_minimum_size = Vector2(382.0 * ui_scale, 372.0 * ui_scale)
 
 
 func _on_more_action(action_name: String) -> void:
@@ -191,7 +202,8 @@ func _make_button(label: String, side: float, accent := false) -> Button:
 	button.custom_minimum_size = Vector2(side, side)
 	button.size = Vector2(side, side)
 	button.add_theme_font_override("font", FactorioStyle.font("default"))
-	button.add_theme_font_size_override("font_size", 15 if label.length() > 3 else 19)
+	button.add_theme_font_size_override("font_size",
+		roundi((15.0 if label.length() > 3 else 19.0) * ui_scale))
 	button.add_theme_color_override("font_color", Color(0.93, 0.91, 0.84))
 	button.add_theme_color_override("font_pressed_color", Color.WHITE)
 	var base := Color(0.72, 0.50, 0.22) if accent else Color(0.62, 0.48, 0.25)
@@ -218,9 +230,33 @@ func _process(delta: float) -> void:
 	if _aim_joystick == null:
 		return
 	var direction := _aim_joystick.direction()
-	if direction.length_squared() <= 0.0001:
+	# The mouse pointer is a tile cursor, not a free-flying dot.  Use the
+	# dominant joystick axis and move exactly one screen tile at a time, then
+	# repeat while held.  This makes building next to a machine much less
+	# fiddly than fine pixel steering with a thumb.
+	var step := Vector2.ZERO
+	if direction.length_squared() > 0.10:
+		if absf(direction.x) >= absf(direction.y):
+			step.x = signf(direction.x)
+		else:
+			step.y = signf(direction.y)
+	if step != _step_direction:
+		_step_direction = step
+		if step != Vector2.ZERO:
+			_step_pointer(step)
+			_step_delay = POINTER_FIRST_DELAY
 		return
-	_pointer += direction * POINTER_SPEED * delta
+	if step == Vector2.ZERO:
+		return
+	_step_delay -= delta
+	if _step_delay <= 0.0:
+		_step_pointer(step)
+		_step_delay = POINTER_REPEAT
+
+
+func _step_pointer(step: Vector2) -> void:
+	var step_pixels := maxf(1.0, tile_pixels)
+	_pointer += step * step_pixels
 	_pointer.x = clampf(_pointer.x, 4.0, size.x - 4.0)
 	_pointer.y = clampf(_pointer.y, 4.0, size.y - 4.0)
 	pointer_changed.emit(_pointer)
@@ -230,53 +266,69 @@ func _process(delta: float) -> void:
 func _draw() -> void:
 	if not _pointer_visible:
 		return
-	draw_circle(_pointer, 13.0, Color(0.02, 0.02, 0.02, 0.45))
-	draw_arc(_pointer, 13.0, 0.0, TAU, 28, Color(1.0, 0.88, 0.45, 0.95), 2.0)
-	draw_line(_pointer + Vector2(-18, 0), _pointer + Vector2(-5, 0),
-		Color(1.0, 0.88, 0.45, 0.95), 2.0)
-	draw_line(_pointer + Vector2(5, 0), _pointer + Vector2(18, 0),
-		Color(1.0, 0.88, 0.45, 0.95), 2.0)
-	draw_line(_pointer + Vector2(0, -18), _pointer + Vector2(0, -5),
-		Color(1.0, 0.88, 0.45, 0.95), 2.0)
-	draw_line(_pointer + Vector2(0, 5), _pointer + Vector2(0, 18),
-		Color(1.0, 0.88, 0.45, 0.95), 2.0)
+	var s := ui_scale
+	var colour := Color(1.0, 0.88, 0.45, 0.95)
+	draw_circle(_pointer, 13.0 * s, Color(0.02, 0.02, 0.02, 0.45))
+	draw_arc(_pointer, 13.0 * s, 0.0, TAU, 28, colour, 2.0 * s)
+	draw_line(_pointer + Vector2(-18, 0) * s, _pointer + Vector2(-5, 0) * s,
+		colour, 2.0 * s)
+	draw_line(_pointer + Vector2(5, 0) * s, _pointer + Vector2(18, 0) * s,
+		colour, 2.0 * s)
+	draw_line(_pointer + Vector2(0, -18) * s, _pointer + Vector2(0, -5) * s,
+		colour, 2.0 * s)
+	draw_line(_pointer + Vector2(0, 5) * s, _pointer + Vector2(0, 18) * s,
+		colour, 2.0 * s)
 
 
 func layout(viewport_size: Vector2) -> void:
 	if _joystick == null:
 		return
-	_joystick.position = Vector2(LEFT_MARGIN,
-		viewport_size.y - JOYSTICK - LEFT_MARGIN)
-	_joystick.size = Vector2(JOYSTICK, JOYSTICK)
+	var s := ui_scale
+	var margin := LEFT_MARGIN * s
+	var gap := GAP * s
+	var button := BUTTON * s
+	var joystick_size := JOYSTICK * s
+	var aim_size := AIM_JOYSTICK * s
+	_joystick.position = Vector2(margin, viewport_size.y - joystick_size - margin)
+	_joystick.size = Vector2(joystick_size, joystick_size)
 	_move_label.position = Vector2(_joystick.position.x,
-		_joystick.position.y + JOYSTICK - 24.0)
-	_move_label.size = Vector2(JOYSTICK, 18)
+		_joystick.position.y + joystick_size - 24.0 * s)
+	_move_label.size = Vector2(joystick_size, 18.0 * s)
 
-	var mouse_y := _joystick.position.y - MOUSE_H - GAP
-	_buttons["lmb"].position = Vector2(LEFT_MARGIN, mouse_y)
-	_buttons["rmb"].position = Vector2(LEFT_MARGIN + MOUSE_W + GAP, mouse_y)
+	var mouse_w := MOUSE_W * s
+	var mouse_h := MOUSE_H * s
+	var mouse_y := _joystick.position.y - mouse_h - gap
+	_buttons["lmb"].position = Vector2(margin, mouse_y)
+	_buttons["rmb"].position = Vector2(margin + mouse_w + gap, mouse_y)
+	_buttons["lmb"].size = Vector2(mouse_w, mouse_h)
+	_buttons["rmb"].size = Vector2(mouse_w, mouse_h)
 
-	var right := viewport_size.x - SAFE
-	var bottom := viewport_size.y - SAFE
-	var bottom_y := bottom - BUTTON
-	var top_y := bottom_y - BUTTON - GAP
-	_buttons["rot"].position = Vector2(right - 3.0 * BUTTON - 2.0 * GAP,
+	var right := viewport_size.x - SAFE * s
+	var bottom := viewport_size.y - SAFE * s
+	var bottom_y := bottom - button
+	var top_y := bottom_y - button - gap
+	_buttons["rot"].position = Vector2(right - 3.0 * button - 2.0 * gap,
 		bottom_y)
-	_buttons["fire"].position = Vector2(right - 2.0 * BUTTON - GAP, bottom_y)
-	_buttons["more"].position = Vector2(right - BUTTON, bottom_y)
-	_buttons["inv"].position = Vector2(right - 2.0 * BUTTON - GAP, top_y)
-	_buttons["tech"].position = Vector2(right - BUTTON, top_y)
+	_buttons["fire"].position = Vector2(right - 2.0 * button - gap, bottom_y)
+	_buttons["more"].position = Vector2(right - button, bottom_y)
+	_buttons["inv"].position = Vector2(right - 2.0 * button - gap, top_y)
+	_buttons["tech"].position = Vector2(right - button, top_y)
+	for key: String in ["rot", "fire", "inv", "tech", "more"]:
+		_buttons[key].size = Vector2(button, button)
 
-	_aim_joystick.size = Vector2(AIM_JOYSTICK, AIM_JOYSTICK)
-	_aim_joystick.position = Vector2(right - AIM_JOYSTICK,
-		top_y - AIM_JOYSTICK - GAP)
+	_aim_joystick.size = Vector2(aim_size, aim_size)
+	_aim_joystick.position = Vector2(right - aim_size,
+		top_y - aim_size - gap)
 	_aim_label.position = Vector2(_aim_joystick.position.x,
-		_aim_joystick.position.y + AIM_JOYSTICK - 24.0)
-	_aim_label.size = Vector2(AIM_JOYSTICK, 18)
+		_aim_joystick.position.y + aim_size - 24.0 * s)
+	_aim_label.size = Vector2(aim_size, 18.0 * s)
 
-	_more.size = Vector2(382, 372)
+	_more.size = Vector2(382.0 * s, 372.0 * s)
+	# On a tall scaled HUD the drawer no longer fits above the aim stick;
+	# pin it to the top-right instead of letting it leave the screen.  It is
+	# above the minimap, so the map can no longer cover its buttons.
 	_more.position = Vector2(right - _more.size.x,
-		_aim_joystick.position.y - _more.size.y - GAP)
+		maxf(8.0 * s, _aim_joystick.position.y - _more.size.y - gap))
 
 	if not _pointer_ready:
 		_pointer = viewport_size * 0.5
@@ -287,7 +339,6 @@ func layout(viewport_size: Vector2) -> void:
 			clampf(_pointer.y, 4.0, viewport_size.y - 4.0))
 	pointer_changed.emit(_pointer)
 	queue_redraw()
-
 
 func _on_resized() -> void:
 	layout(get_viewport_rect().size)
@@ -322,6 +373,8 @@ func reset() -> void:
 	if _aim_joystick != null:
 		_aim_joystick.reset()
 	_pointer_visible = false
+	_step_direction = Vector2.ZERO
+	_step_delay = 0.0
 	queue_redraw()
 	if _more != null:
 		_more.visible = false

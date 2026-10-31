@@ -112,8 +112,32 @@ static func _resolve(node: Variant, ctx: Dictionary, direction: int, frame: int,
 	if node.has("stripes"):
 		var stripes: Array = node["stripes"]
 		if not stripes.is_empty():
-			var pick := posmod(direction, stripes.size())
-			_resolve(stripes[pick], local, direction, frame, variation, in_variations, out, as_row)
+			# ``stripes`` splits a direction range over several files.  A
+			# turret gun has 64 directions in 4 stripes of 16, so the stripe is
+			# direction/16 and the direction inside it is direction%16; the old
+			# direction mod 4 kept picking the first stripe and the gun never
+			# turned.
+			var total_dirs := maxi(int(local.get("direction_count", 1)),
+				stripes.size())
+			var per_stripe := maxi(1, int(total_dirs / stripes.size()))
+			# ``direction`` is a 16-way defines.direction unless the caller
+			# already supplied a raw row.  Scale it to this sheet's rotation
+			# count first; a 64-direction gun then picks stripe 1 for east
+			# instead of the fourth rotation of stripe 0.
+			var global_dir := int(direction)
+			if not as_row:
+				global_dir = row_for(int(direction), total_dirs)
+			# Stripe sheets are ordered counter-clockwise (north, west,
+			# south, east for the gun turret) while defines.direction is
+			# clockwise.  Mirror the index before choosing the file and the
+			# row, or the gun points west when it should point east.
+			var ordered := posmod(total_dirs - global_dir, total_dirs)
+			var pick := posmod(int(ordered / per_stripe), stripes.size())
+			var local_dir := posmod(ordered, per_stripe)
+			var stripe_ctx := local.duplicate()
+			stripe_ctx["direction_count"] = per_stripe
+			_resolve(stripes[pick], stripe_ctx, local_dir, frame, variation,
+				in_variations, out, as_row)
 		return
 
 	# ``sheet`` is the single-sheet shorthand of the *Variations wrappers.
@@ -150,7 +174,8 @@ static func _resolve(node: Variant, ctx: Dictionary, direction: int, frame: int,
 
 static func _context(node: Dictionary, parent: Dictionary) -> Dictionary:
 	var ctx := parent.duplicate()
-	for key in ["frame_count", "direction_count", "variation_count", "line_length"]:
+	for key in ["frame_count", "direction_count", "variation_count",
+			"line_length", "width", "height"]:
 		if node.has(key):
 			ctx[key] = int(node[key])
 	if node.has("shift"):
@@ -320,9 +345,21 @@ static func _emit_multi_file(node: Dictionary, ctx: Dictionary, direction: int,
 	var variation_count := _int(ctx, "variation_count", 1)
 	var slice := int(node.get("slice", frame_count))
 
-	var per_file := maxi(1, slice * direction_count * variation_count)
+	# A ``filenames`` list splits one big rotation sheet over several images.
+	# Each file holds ``line_length * lines_per_file`` sprites (a train has 4
+	# columns by 8 rows), not one full direction_count, so the old
+	# ``slice * direction_count`` stride sent every rotation to file 0 and the
+	# locomotive was drawn from a single, unrotated frame.
+	var line_length := maxi(1, int(node.get("line_length", slice)))
+	var frames_per_file := maxi(1, line_length * lines_per_file)
 	var index := _sprite_index(frame_count, direction_count, variation_count,
 		direction, frame, variation, in_variations, as_row)
+	var per_file := frames_per_file
+	if filenames.size() > 1 and index / per_file >= filenames.size():
+		# Very large rotations can spill past the explicit file list; fall
+		# back to dividing the sheet evenly.
+		per_file = maxi(1, ceili(float(frame_count * direction_count
+			* variation_count) / float(filenames.size())))
 	var file_index := index / per_file
 	if file_index >= filenames.size():
 		file_index = filenames.size() - 1
@@ -356,6 +393,12 @@ static func _sprite_size(node: Dictionary, ctx: Dictionary, image_size: Vector2)
 			return FactorioAssets.parse_vector(size)
 		if size is float or size is int:
 			return Vector2(float(size), float(size))
+	# A stripe inherits its frame size from the parent animation; the stripe
+	# node's ``width_in_frames`` only says how many frames are packed into that
+	# image.  Ignoring the inherited size drew both gun frames side by side
+	# (a 264px-wide sprite for a 132px frame), which hid the rotating turret.
+	if ctx.has("width") and ctx.has("height"):
+		return Vector2(float(ctx["width"]), float(ctx["height"]))
 	# Character shadows are packed as a fixed grid inside one file.
 	if node.has("width_in_frames") and node.has("height_in_frames"):
 		return Vector2(
@@ -363,8 +406,6 @@ static func _sprite_size(node: Dictionary, ctx: Dictionary, image_size: Vector2)
 			image_size.y / maxf(float(node["height_in_frames"]), 1.0))
 	if node.has("width") and node.has("height"):
 		return Vector2(float(node["width"]), float(node["height"]))
-	if ctx.has("width") and ctx.has("height"):
-		return Vector2(float(ctx["width"]), float(ctx["height"]))
 	return image_size
 
 

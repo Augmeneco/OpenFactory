@@ -114,14 +114,25 @@ func texture(reference: String) -> ImageTexture:
 ## works on real filesystem files, while an exported build stores the bundled
 ## Factorio data inside the PCK as ``res://`` entries.
 func _load_image(source: String, original_path: String) -> Image:
-	if source.begins_with("res://") or source.begins_with("user://"):
-		var bytes := FileAccess.get_file_as_bytes(source)
-		if bytes.is_empty():
-			return null
-		var image := Image.new()
-		var extension := original_path.get_extension().to_lower()
-		var error := ERR_FILE_UNRECOGNIZED
-		match extension:
+	var bytes := FileAccess.get_file_as_bytes(source)
+	if bytes.is_empty():
+		return null
+	var image := Image.new()
+	# Packed files keep their original ``.png.bin`` name even when the build
+	# was staged with WebP bytes; decide by magic, not by extension.
+	var magic := bytes.slice(0, 4).get_string_from_ascii()
+	var error := ERR_FILE_UNRECOGNIZED
+	if magic == "RIFF" and bytes.size() >= 12 \
+			and bytes.slice(8, 4).get_string_from_ascii() == "WEBP":
+		error = image.load_webp_from_buffer(bytes)
+	elif bytes.size() >= 4 and bytes[0] == 0x89 \
+			and bytes.slice(1, 3).get_string_from_ascii() == "PNG":
+		error = image.load_png_from_buffer(bytes)
+	elif bytes.size() >= 3 and bytes[0] == 0xFF and bytes[1] == 0xD8 \
+			and bytes[2] == 0xFF:
+		error = image.load_jpg_from_buffer(bytes)
+	else:
+		match original_path.get_extension().to_lower():
 			"png":
 				error = image.load_png_from_buffer(bytes)
 			"jpg", "jpeg":
@@ -134,8 +145,7 @@ func _load_image(source: String, original_path: String) -> Image:
 				error = image.load_tga_from_buffer(bytes)
 			_:
 				error = ERR_FILE_UNRECOGNIZED
-		return image if error == OK else null
-	return Image.load_from_file(source)
+	return image if error == OK else null
 
 
 static func _bytes_per_pixel(img: Image) -> int:

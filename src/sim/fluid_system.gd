@@ -179,6 +179,22 @@ func rebuild() -> void:
 				if parent.has(other_key):
 					_union(parent, str(box["key"]), other_key)
 
+	# Pipe-to-ground halves are one tunnel even when the gap is longer than
+	# the single tile that the normal pipe_connections can see.  Join their
+	# boxes explicitly; this is the fluid equivalent of the belt tunnel.
+	for entity: Entity in world.entities.values():
+		if entity.is_ghost() or entity.proto_type != "pipe-to-ground":
+			continue
+		var partner := underground_pipe_partner(world, entity)
+		if partner == null:
+			continue
+		for spec: Dictionary in box_specs(entity):
+			var key := _key(entity, str(spec["name"]))
+			for other_spec: Dictionary in box_specs(partner):
+				var other_key := _key(partner, str(other_spec["name"]))
+				if parent.has(key) and parent.has(other_key):
+					_union(parent, key, other_key)
+
 	var groups: Dictionary = {}
 	for box: Dictionary in boxes:
 		var root := _find(parent, str(box["key"]))
@@ -211,6 +227,14 @@ static func connection_targets(world: GameWorld, entity: Entity,
 	var out: Array = []
 	for connection: Variant in spec.get("connections", []):
 		if not (connection is Dictionary):
+			continue
+		# A pipe-to-ground's underground port is not a normal neighbour
+		# link: it must only meet the other half of its tunnel, which is
+		# joined explicitly in rebuild().  Treating it as an ordinary pipe
+		# connection made a pipe sitting over the tunnel mouth leak into the
+		# network through the ground.
+		if str((connection as Dictionary).get(
+				"connection_type", "")) == "underground":
 			continue
 		# Most boxes give one ``position``; a pumpjack lists several in
 		# ``positions``.
@@ -265,6 +289,47 @@ static func connects(world: GameWorld, a: Entity, b: Entity) -> bool:
 			if boxes_linked(world, a, spec_a, b, spec_b):
 				return true
 	return false
+
+
+## The underground half of a pipe-to-ground's fluid box, if any.
+static func underground_connection(entity: Entity) -> Dictionary:
+	for spec: Dictionary in box_specs(entity):
+		for connection: Variant in spec.get("connections", []):
+			if connection is Dictionary and str((connection as Dictionary).get(
+					"connection_type", "")) == "underground":
+				return connection
+	return {}
+
+
+## The other end of a pipe-to-ground tunnel, up to its prototype's
+## max_underground_distance.  The two halves face opposite ways, so the
+## partner's underground connection points back at this entity.
+static func underground_pipe_partner(world: GameWorld,
+		entity: Entity) -> Entity:
+	if entity == null or entity.proto_type != "pipe-to-ground":
+		return null
+	var connection := underground_connection(entity)
+	if connection.is_empty():
+		return null
+	var direction := posmod(entity.direction \
+		+ int(connection.get("direction", 8)), 16)
+	var step := BeltSim.dir_vector(direction)
+	var max_distance := maxi(1, int(connection.get(
+		"max_underground_distance", 10)))
+	for k in range(1, max_distance + 1):
+		var other := world.entity_at(entity.origin + step * k)
+		if other == null or other == entity or other.is_ghost():
+			continue
+		if other.proto_type != "pipe-to-ground" or other.name != entity.name:
+			continue
+		var other_connection := underground_connection(other)
+		if other_connection.is_empty():
+			continue
+		var other_direction := posmod(other.direction \
+			+ int(other_connection.get("direction", 8)), 16)
+		if posmod(direction + 8, 16) == other_direction:
+			return other
+	return null
 
 
 func _find(parent: Dictionary, key: String) -> String:

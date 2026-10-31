@@ -198,6 +198,37 @@ func stream_at(reference_path: String) -> AudioStream:
 	return stream
 
 
+## Decode every variation of a sound reference now, so the first shot in a
+## firefight does not spend its frame inside Ogg decoding.
+func prewarm(reference: Variant) -> void:
+	var paths: Dictionary = {}
+	_collect_paths(reference, paths)
+	for path: String in paths:
+		stream_at(path)
+
+
+func _collect_paths(reference: Variant, out: Dictionary) -> void:
+	if reference == null:
+		return
+	if reference is String:
+		if not str(reference).is_empty():
+			out[str(reference)] = true
+		return
+	if reference is Array:
+		for entry: Variant in reference:
+			_collect_paths(entry, out)
+		return
+	if not (reference is Dictionary):
+		return
+	var entry: Dictionary = reference
+	if entry.has("variations"):
+		_collect_paths(entry["variations"], out)
+	if entry.has("sound"):
+		_collect_paths(entry["sound"], out)
+	if entry.has("filename"):
+		_collect_paths(entry["filename"], out)
+
+
 func has_sound(reference: Variant) -> bool:
 	return not resolve(reference).is_empty()
 

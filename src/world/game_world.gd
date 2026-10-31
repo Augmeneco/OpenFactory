@@ -34,6 +34,9 @@ var _chunk_entities: Dictionary = {}  ## Vector2i -> Array[Entity]
 ## ore, an entity.  The renderer keeps its prepared ground rectangles keyed by
 ## this, so it can reuse them instead of rebuilding thousands of cells a frame.
 var revision := 0
+## Bumped only when entities change, not when ore depletes.  The far-zoom
+## decorative chunk cache keys off this so mining does not repaint forests.
+var decor_revision := 0
 ## Per-cell change stamps, so a map view can cache one cell's colour and only
 ## recompute the cells that actually changed (mining one ore tile, setting one
 ## tile) instead of throwing away the whole picture.
@@ -50,6 +53,10 @@ var _next_chunk_stamp := 0
 ## its stage does.  The renderer's cached chunk textures are keyed by this, so
 ## mining does not re-rasterise a chunk every frame.
 var _chunk_visual_stamps: Dictionary = {}
+## Belt-tunnel pairing cache, keyed by ``revision``.
+var _underground_pairs: Dictionary = {}
+var _underground_pairs_revision := -1
+var _normalizing_underground := false
 var _next_chunk_visual_stamp := 0
 ## Incremented when the whole map is replaced (new game, load), so caches that
 ## remember one cell's colour can throw everything away even though the
@@ -355,43 +362,110 @@ static func _resource_matches(resource: Dictionary, categories: Array) -> bool:
 	return categories.has(category)
 
 
-## Factorio decides which half of an underground belt you are placing: if
-## there is already a matching half behind, this one is the exit.
+## Factorio decides which half of an underground belt you are placing.
 ##
-## The reverse order is supported too.  A player may put the far half down
-## first and the near half afterwards; in that case the new half is the
-## entrance and the existing half ahead is promoted to the exit.  Without
-## this the two halves were both "input" and the tunnel never carried items.
+## Halves are grouped by prototype name and facing, sorted along their travel
+## direction and paired two at a time: the earlier one is the entrance, the
+## later one the exit.  That single rule handles every placement order — near
+## half first, far half first, or a player dropping several in a row — and,
+## crucially, makes a shared half impossible: an entrance has exactly one
+## exit and an exit has exactly one entrance.
 func orient_underground(entity: Entity) -> void:
 	if entity.proto_type != "underground-belt":
 		return
-	var proto := entity.prototype()
-	var max_distance := int(proto.get("max_distance", 5))
-	var step := BeltSim.dir_vector(entity.direction)
-	# 1. An input behind means this half is the exit.
-	for k in range(1, max_distance + 1):
-		var behind := entity_at(entity.origin - step * k)
-		if behind == null:
+	normalize_underground()
+
+
+## ``entity instance id -> partner instance id`` for every paired belt tunnel.
+##
+## Recomputed from world state rather than remembered, so rotating or removing
+## a half can never leave a stale link behind.  Cheap: only underground belts
+## with one shared prototype and facing are grouped.
+func underground_pairs() -> Dictionary:
+	if _underground_pairs_revision == revision:
+		return _underground_pairs
+	_underground_pairs_revision = revision
+	var groups: Dictionary = {}
+	# `entities_of_type` is an index lookup; walking the whole entity table
+	# here would run over thousands of trees every time a belt was mined.
+	for candidate: Entity in entities_of_type("underground-belt"):
+		if candidate.is_ghost():
 			continue
-		if behind.proto_type == "underground-belt" and behind.name == entity.name \
-				and posmod(behind.direction, 16) == posmod(entity.direction, 16) \
-				and str(behind.state.get("io", "input")) == "input":
-			entity.state["io"] = "output"
-			return
-	# 2. Otherwise this is the entrance.  If the exit was placed first, it is
-	#    sitting ahead as an "input"; promote the first matching half.
-	entity.state["io"] = "input"
-	for k in range(1, max_distance + 1):
-		var ahead := entity_at(entity.origin + step * k)
-		if ahead == null:
+		var facing := posmod(candidate.direction, 16)
+		# Halves only pair along their own line: two tunnels running east on
+		# different rows must never be joined just because they share a
+		# facing.  The perpendicular coordinate identifies the lane.
+		var lane := candidate.origin.y if facing == 4 or facing == 12 \
+			else candidate.origin.x
+		var key := "%s|%d|%d" % [candidate.name, facing, lane]
+		if not groups.has(key):
+			groups[key] = []
+		(groups[key] as Array).append(candidate)
+
+	var pairs: Dictionary = {}
+	for key: String in groups:
+		var members: Array = groups[key]
+		if members.size() < 2:
 			continue
-		if ahead.proto_type != "underground-belt" or ahead.name != entity.name:
+		var facing := posmod((members[0] as Entity).direction, 16)
+		var axis := Vector2(BeltSim.dir_vector(facing))
+		members.sort_custom(func(a: Entity, b: Entity) -> bool:
+			return Vector2(a.origin).dot(axis) < Vector2(b.origin).dot(axis))
+		var max_distance := int((members[0] as Entity).prototype().get(
+			"max_distance", 5))
+		var index := 0
+		while index + 1 < members.size():
+			var entrance: Entity = members[index]
+			var exit_entity: Entity = members[index + 1]
+			var span := (exit_entity.origin - entrance.origin).length()
+			if span <= float(max_distance):
+				pairs[entrance.get_instance_id()] = exit_entity.get_instance_id()
+				pairs[exit_entity.get_instance_id()] = entrance.get_instance_id()
+				index += 2
+			else:
+				# Too far apart to be one tunnel; the extra half is inert.
+				index += 1
+	_underground_pairs = pairs
+	return pairs
+
+
+## The other half of a belt tunnel, or ``null`` when this half is unpaired.
+func underground_partner(entity: Entity) -> Entity:
+	if entity == null or entity.proto_type != "underground-belt":
+		return null
+	var id: Variant = underground_pairs().get(entity.get_instance_id())
+	if id == null:
+		return null
+	for candidate: Entity in entities_of_type("underground-belt"):
+		if candidate.get_instance_id() == int(id):
+			return candidate
+	return null
+
+
+## Rewrite every underground belt's input/output role from the pair list.
+func normalize_underground() -> void:
+	if _normalizing_underground:
+		return
+	_normalizing_underground = true
+	_underground_pairs_revision = -1
+	var halves: Array = []
+	var by_id: Dictionary = {}
+	for entity: Entity in entities_of_type("underground-belt"):
+		if entity.is_ghost():
 			continue
-		if posmod(ahead.direction, 16) != posmod(entity.direction, 16):
+		halves.append(entity)
+		by_id[entity.get_instance_id()] = entity
+	var pairs := underground_pairs()
+	for entity: Entity in halves:
+		var partner: Variant = by_id.get(pairs.get(entity.get_instance_id(), -1))
+		if partner == null:
+			entity.state["io"] = "input"
 			continue
-		if str(ahead.state.get("io", "input")) == "input":
-			ahead.state["io"] = "output"
-		break
+		var axis := Vector2(BeltSim.dir_vector(entity.direction))
+		var self_proj := Vector2(entity.origin).dot(axis)
+		var other_proj := Vector2((partner as Entity).origin).dot(axis)
+		entity.state["io"] = "input" if self_proj < other_proj else "output"
+	_normalizing_underground = false
 
 
 func place_entity(entity: Entity) -> bool:
@@ -429,6 +503,11 @@ func place_entity(entity: Entity) -> bool:
 			if initial_value > 0.0 and initial_ratio > 0.0:
 				entity.state["burn_energy"] = initial_value * initial_ratio
 	revision += 1
+	decor_revision += 1
+	# Underground halves are paired by position, so a new half changes the
+	# roles of its neighbours too.
+	if entity.proto_type == "underground-belt" and not entity.is_ghost():
+		normalize_underground()
 	entity_placed.emit(entity)
 	return true
 
@@ -504,6 +583,7 @@ func rotate_entity(entity: Entity, new_direction: int) -> bool:
 		orient_underground(entity)
 	_index_dirty = true
 	revision += 1
+	decor_revision += 1
 	return true
 
 
@@ -553,6 +633,11 @@ func place_ghost(entity: Entity) -> bool:
 	_index_entity(entity)
 	_index_dirty = true
 	revision += 1
+	decor_revision += 1
+	# Underground halves are paired by position, so a new half changes the
+	# roles of its neighbours too.
+	if entity.proto_type == "underground-belt" and not entity.is_ghost():
+		normalize_underground()
 	entity_placed.emit(entity)
 	return true
 
@@ -561,14 +646,26 @@ func place_ghost(entity: Entity) -> bool:
 func revive_ghost(ghost: Entity) -> Entity:
 	var direction := ghost.direction
 	var origin := ghost.origin
-	var recipe := str(ghost.state.get("recipe", ""))
 	var proto_type := str(ghost.state.get("ghost_of", ghost.proto_type))
+	# Everything the player configured on the ghost travels with it: recipe,
+	# chest requests, filters, station name, circuit settings.  Runtime keys
+	# and inventories stay with the ghost and are never copied onto the real
+	# entity.
+	var config := ghost.state.duplicate(true)
 	remove_entity(ghost)
 	var real := Entity.create(proto_type, ghost.name, origin, direction)
 	if not place_entity(real):
 		return null
-	if not recipe.is_empty():
-		real.state["recipe"] = recipe
+	for key: String in config:
+		if key in ["ghost", "ghost_of", "health", "progress", "consumed",
+				"working_tick", "ran", "inventories", "fluids", "items",
+				"io"]:
+			continue
+		var value: Variant = config[key]
+		if value is Dictionary or value is Array:
+			real.state[key] = (value as Variant).duplicate(true)
+		else:
+			real.state[key] = value
 	return real
 
 
@@ -589,6 +686,9 @@ func remove_entity(entity: Entity) -> void:
 			_entity_owner.erase(cell)
 	_index_dirty = true
 	revision += 1
+	decor_revision += 1
+	if entity.proto_type == "underground-belt":
+		normalize_underground()
 	entity_removed.emit(entity)
 
 
@@ -672,6 +772,7 @@ func clear_all() -> void:
 	epoch += 1
 	_index_dirty = true
 	revision += 1
+	decor_revision += 1
 
 
 ## Install a chunk verbatim (loading a save, rather than generating).
@@ -684,3 +785,4 @@ func install_chunk(coord: Vector2i, loaded: Chunk) -> void:
 	epoch += 1
 	_index_dirty = true
 	revision += 1
+	decor_revision += 1

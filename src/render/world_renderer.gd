@@ -32,6 +32,12 @@ var show_alt := false
 ## Camera scale (viewport pixels per world pixel) at or below which terrain is
 ## drawn from cached simplified chunks instead of individual tile sprites.
 var ground_lod_threshold := 0.70
+## Below this scale trees/rocks switch to one cached quad per prototype.
+const LOW_ZOOM_DECOR_SCALE := 0.65
+## Below this scale the whole visible forest is baked into one transparent
+## quad per chunk; drawing every tree individually still costs too much here.
+const DECOR_CHUNK_SCALE := 0.45
+const DECOR_CHUNK_PX := 8
 ## When true, only chunks the game has generated are drawn.  Remote view and
 ## the normal camera then cannot reveal terrain without a radar/player loader.
 var require_generated_chunks := false
@@ -40,6 +46,12 @@ var require_revealed_chunks := false
 
 var _anim_time := 0.0
 var _item_icons: Dictionary = {}
+## One precomposed quad per decorative prototype, used only at far zoom.
+var _decor_icons: Dictionary = {}
+## Per-chunk transparent images containing all trees/rocks, and the resized
+## source icons used to compose them.
+var _decor_chunk_cache: Dictionary = {}
+var _decor_overlay_icons: Dictionary = {}
 ## Soft dark halo drawn behind an ALT-mode icon so the icon stays readable
 ## over the busy machine artwork.
 var _alt_backdrop: Texture2D
@@ -1009,18 +1021,32 @@ func _entities_in_view(min_cell: Vector2i, max_cell: Vector2i) -> Array:
 ## the frame so the view is not rebuilt three times.
 func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 	var shadows: Array = []
+	var decor: Array = []
 	var bodies: Array = []
 	var badges: Array = []
 	_sequence = 0
 	_frame_entities = _entities_in_view(min_cell, max_cell)
+	if _render_scale < DECOR_CHUNK_SCALE:
+		_emit_decor_chunks(out, min_cell, max_cell)
 
 	for entity: Entity in _frame_entities:
-		# Cull by zoom before touching the chunk map.  Trees and rocks are the
-		# overwhelming majority of the entity table, and at low zoom they are
-		# invisible anyway.
-		if _render_scale < 0.65 and entity.proto_type in [
-				"tree", "simple-entity", "item-entity"]:
+		# Ground items are tiny at low zoom, but trees and rocks are always
+		# drawn: the world should not lose its scenery just because the camera
+		# was pulled back.
+		if _render_scale < 0.65 and entity.proto_type == "item-entity":
 			continue
+		if entity.proto_type in ["tree", "simple-entity"]:
+			if _render_scale < DECOR_CHUNK_SCALE:
+				# Already baked into the per-chunk decorative overlay above.
+				continue
+			if _render_scale < LOW_ZOOM_DECOR_SCALE:
+				# At this size a tree is a few pixels.  Resolving its full
+				# trunk/leaves/shadow stack for every tree is what dropped
+				# the frame rate; use one cached quad per prototype instead,
+				# which also lets the whole forest batch on a few textures.
+				if not entity.is_ghost():
+					_emit_low_zoom_decor(decor, entity)
+				continue
 		if _render_scale < 0.22 and entity.proto_type in [
 				"inserter", "electric-pole", "big-electric-pole", "substation",
 				"pipe", "pipe-to-ground", "wall", "gate", "item-entity"]:
@@ -1087,6 +1113,11 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 			var tile_shift := Vector2.ZERO
 			if node_index < node_offsets.size():
 				tile_shift = Vector2(node_offsets[node_index]) * TILE
+			var node_rotation := 0.0
+			var node_rotations: Variant = visual_data.get("rotate_nodes", {})
+			if node_rotations is Dictionary:
+				node_rotation = float((node_rotations as Dictionary).get(
+					node_index, 0.0))
 			node_index += 1
 			var flipped := node_index - 1 < node_flips.size() \
 				and bool(node_flips[node_index - 1])
@@ -1102,13 +1133,20 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 				frame = int(visual_data["frame"])
 			var layers: Array = SpriteCache.layers_row(graphics, direction, frame,
 				variation, tag) if use_row else SpriteCache.layers(graphics,
-				entity.direction, frame, variation, tag)
+				direction, frame, variation, tag)
 			for layer: SpriteSource.Layer in layers:
 				# These are additive light masks: the batched canvas cannot
 				# blend them, and drawing one normally paints an opaque black
 				# rectangle over the machine (the furnace looked textureless
 				# while smelting).
 				if layer.light or layer.additive:
+					continue
+				# Turret masks are player-colour overlays.  When the gun turns
+				# east/west the small mask sat on top of the barrel and made the
+				# turret look empty; the base and gun themselves carry the art.
+				if layer.runtime_tint and entity.proto_type in [
+						"ammo-turret", "electric-turret", "fluid-turret",
+						"artillery-turret"]:
 					continue
 				any = true
 				var dest := Rect2(center + tile_shift + layer.offset - layer.size * 0.5,
@@ -1130,7 +1168,7 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 					"src": layer.src_rect,
 					"dest": dest,
 					"modulate": modulate,
-					"rotation": spin + layer.rotation,
+					"rotation": spin + layer.rotation + node_rotation,
 					"flip_h": flipped,
 					"sort_y": center.y,
 					"seq": _sequence,
@@ -1158,16 +1196,213 @@ func _emit_entities(out: Array, min_cell: Vector2i, max_cell: Vector2i) -> void:
 	_emit_wires(bodies, min_cell, max_cell)
 	_emit_power_wires(bodies, min_cell, max_cell)
 
+	_emit_corpses(shadows, bodies, min_cell, max_cell)
 	_emit_units(shadows, bodies, min_cell, max_cell)
 	_emit_robots(shadows, bodies, min_cell, max_cell)
 	_emit_trains(shadows, bodies, min_cell, max_cell)
 	_emit_belt_items(bodies, min_cell, max_cell)
 
+	decor.sort_custom(_sort_by_texture)
+	out.append_array(decor)
 	out.append_array(shadows)
 	bodies.sort_custom(_sort_by_depth)
 	out.append_array(bodies)
 	# Badges are UI-ish and stay above every world object.
 	out.append_array(badges)
+	# Red X over buildings marked by a shift-paste; the blue ghost that will
+	# replace them is not in the world yet.
+	if simulation != null and simulation.logistics != null:
+		for order: Dictionary in simulation.logistics.deconstruction:
+			var marked: Variant = order.get("entity")
+			if not (marked is Entity):
+				continue
+			var entity: Entity = marked
+			if not world.entities.has(entity.origin):
+				continue
+			var centre := entity.center() * TILE
+			var half := maxf(10.0, minf(entity.size.x, entity.size.y) * TILE * 0.45)
+			for sign_y in [-1.0, 1.0]:
+				var a := centre + Vector2(-half, half * sign_y)
+				var b := centre + Vector2(half, -half * sign_y)
+				out.append({
+					"line": [a.x, a.y, b.x, b.y, 1.0, 0.28, 0.2],
+					"line_alpha": 0.95, "width": 2.5,
+				})
+	# Turret tracers: a couple of frames of yellow line per shot.
+	if simulation != null:
+		for shot: Dictionary in simulation.turret_shots:
+			var from: Vector2 = Vector2(shot.get("from", Vector2.ZERO)) * TILE
+			var to: Vector2 = Vector2(shot.get("to", Vector2.ZERO)) * TILE
+			out.append({
+				"line": [from.x, from.y, to.x, to.y, 1.0, 0.9, 0.35],
+				"line_alpha": 0.9, "width": 2.0,
+			})
+
+
+## Bake every tree/rock of a chunk into one transparent texture.  At very
+## low zoom the forest covers many chunks, but each chunk becomes a single
+## quad instead of hundreds of tree sprites and texture switches.
+func _emit_decor_chunks(out: Array, min_cell: Vector2i,
+		max_cell: Vector2i) -> void:
+	var first := GameWorld.chunk_of(min_cell)
+	var last := GameWorld.chunk_of(max_cell)
+	for cy in range(first.y, last.y + 1):
+		for cx in range(first.x, last.x + 1):
+			var coord := Vector2i(cx, cy)
+			var texture := _decor_chunk_texture(coord)
+			if texture == null:
+				continue
+			var origin := Vector2(coord.x, coord.y) * float(GameWorld.CHUNK) * TILE
+			out.append({
+				"texture": texture,
+				"path": "decor-chunk:%s" % coord,
+				"src": Rect2(Vector2.ZERO, texture.get_size()),
+				"dest": Rect2(origin,
+					Vector2(GameWorld.CHUNK, GameWorld.CHUNK) * TILE),
+				"modulate": Color.WHITE,
+				"rotation": 0.0,
+				"sort_y": origin.y,
+				"seq": _sequence,
+			})
+			_sequence += 1
+
+
+func _decor_chunk_texture(coord: Vector2i) -> Texture2D:
+	var cached: Variant = _decor_chunk_cache.get(coord)
+	if cached is Dictionary and int(cached.get("revision", -1)) \
+			== world.decor_revision:
+		return cached.get("texture")
+	var entities := world.chunk_entities(coord)
+	if entities.is_empty():
+		_decor_chunk_cache[coord] = {"revision": world.decor_revision,
+			"texture": null}
+		return null
+	var pixels := GameWorld.CHUNK * DECOR_CHUNK_PX
+	var image := Image.create(pixels, pixels, false, Image.FORMAT_RGBA8)
+	image.fill(Color(0, 0, 0, 0))
+	var painted := 0
+	var world_origin := Vector2(coord.x, coord.y) * float(GameWorld.CHUNK) * TILE
+	for entity: Entity in entities:
+		if entity.is_ghost() or entity.proto_type not in ["tree", "simple-entity"]:
+			continue
+		var icon := _decor_icon(entity)
+		if icon.is_empty():
+			continue
+		var source: Variant = _decor_overlay_icon(icon)
+		if not (source is Image):
+			continue
+		var src_image := source as Image
+		var scale := float(DECOR_CHUNK_PX) / TILE
+		var center := (entity.center() * TILE - world_origin) * scale
+		var offset: Vector2 = icon["offset"] * scale
+		var size := Vector2i(src_image.get_width(), src_image.get_height())
+		var top_left := center + offset - Vector2(size) * 0.5
+		image.blend_rect(src_image, Rect2i(Vector2i.ZERO, size),
+			Vector2i(roundi(top_left.x), roundi(top_left.y)))
+		painted += 1
+	if painted == 0:
+		_decor_chunk_cache[coord] = {"revision": world.decor_revision,
+			"texture": null}
+		return null
+	var texture := ImageTexture.create_from_image(image)
+	if _decor_chunk_cache.size() > 64:
+		_decor_chunk_cache.clear()
+	_decor_chunk_cache[coord] = {"revision": world.decor_revision,
+		"texture": texture}
+	return texture
+
+
+func _decor_overlay_icon(icon: Dictionary) -> Variant:
+	var texture: Texture2D = icon["texture"]
+	var src: Rect2 = icon["src"]
+	var key := "%s|%.0f,%.0f,%.0f,%.0f" % [icon["path"],
+		src.position.x, src.position.y, src.size.x, src.size.y]
+	var cached: Variant = _decor_overlay_icons.get(key)
+	if cached != null:
+		return cached
+	var full := texture.get_image()
+	if full == null:
+		return null
+	var region := full.get_region(Rect2i(
+		Vector2i(roundi(src.position.x), roundi(src.position.y)),
+		Vector2i(roundi(src.size.x), roundi(src.size.y))))
+	region.convert(Image.FORMAT_RGBA8)
+	var size: Vector2 = icon["size"]
+	var target := Vector2i(
+		maxi(1, roundi(size.x * float(DECOR_CHUNK_PX) / TILE)),
+		maxi(1, roundi(size.y * float(DECOR_CHUNK_PX) / TILE)))
+	region.resize(target.x, target.y, Image.INTERPOLATE_BILINEAR)
+	_decor_overlay_icons[key] = region
+	return region
+
+
+## Far-zoom trees and rocks collapse to one cached sprite.  The regular path
+## resolves three layers and a shadow for every tree, which is both expensive
+## to build and impossible to batch across variants; this keeps the scenery
+## visible at a fraction of the cost.
+func _emit_low_zoom_decor(out: Array, entity: Entity) -> void:
+	var icon := _decor_icon(entity)
+	if icon.is_empty():
+		return
+	var center := entity.center() * TILE
+	var offset: Vector2 = icon["offset"]
+	var size: Vector2 = icon["size"]
+	out.append({
+		"texture": icon["texture"],
+		"path": icon["path"],
+		"src": icon["src"],
+		"dest": Rect2(center + offset - size * 0.5, size),
+		"modulate": Color.WHITE,
+		"rotation": 0.0,
+		"sort_y": center.y,
+		"seq": _sequence,
+	})
+	_sequence += 1
+
+
+func _decor_icon(entity: Entity) -> Dictionary:
+	var key := entity.name
+	var cached: Variant = _decor_icons.get(key)
+	if cached != null:
+		return cached
+	var visual := EntityVisuals.visual(entity, 0, world)
+	if visual.is_empty():
+		_decor_icons[key] = {}
+		return {}
+	var nodes: Array = visual.get("nodes", [])
+	if nodes.is_empty():
+		_decor_icons[key] = {}
+		return {}
+	# Trees expose trunk/leaves/shadow; the canopy alone reads as a tree at
+	# far zoom.  Rocks and other simple entities have a single picture.
+	var node_index := 0
+	if entity.proto_type == "tree" and nodes.size() > 1:
+		node_index = 1
+	var graphics: Variant = nodes[node_index]
+	var layers: Array = SpriteCache.layers(graphics, 0, 0, 0,
+		"decor_icon/%s/%d" % [entity.name, node_index])
+	for layer: SpriteSource.Layer in layers:
+		if layer.texture == null or layer.shadow:
+			continue
+		var icon := {
+			"texture": layer.texture,
+			"path": layer.reference,
+			"src": layer.src_rect,
+			"offset": layer.offset,
+			"size": layer.size,
+		}
+		_decor_icons[key] = icon
+		return icon
+	_decor_icons[key] = {}
+	return {}
+
+
+static func _sort_by_texture(a: Dictionary, b: Dictionary) -> bool:
+	var ta: Texture2D = a.get("texture")
+	var tb: Texture2D = b.get("texture")
+	if ta == tb:
+		return float(a.get("sort_y", 0.0)) < float(b.get("sort_y", 0.0))
+	return ta.get_instance_id() < tb.get_instance_id()
 
 
 ## Cache identity of one graphics node of an entity.  Shared by the draw loop
@@ -1470,6 +1705,63 @@ func _alt_icon(entity: Entity) -> Texture2D:
 	if not mode.is_empty():
 		return FactorioAssets.prototype_icon(proto, 64)
 	return null
+
+
+## Dead biters and spitters, under the living ones.
+func _emit_corpses(shadows: Array, bodies: Array, min_cell: Vector2i,
+		max_cell: Vector2i) -> void:
+	if simulation == null:
+		return
+	for corpse: Dictionary in simulation.corpses:
+		var proto := Prototypes.get_p("corpse", str(corpse.get("name", "")))
+		if proto.is_empty():
+			continue
+		var position: Vector2 = Vector2(corpse["position"]) * TILE
+		var cell := Vector2i(int(floor(position.x / TILE)),
+			int(floor(position.y / TILE)))
+		if cell.x < min_cell.x - 3 or cell.x > max_cell.x + 3 \
+				or cell.y < min_cell.y - 3 or cell.y > max_cell.y + 3:
+			continue
+		var node: Variant = proto.get("decay_animation" \
+			if str(corpse.get("stage", "death")) == "decay" else "animation")
+		if node == null:
+			continue
+		# Sample the death and decay sheets in four-frame steps.  Resolving a
+		# fresh corpse frame for every rotting body every tick was the frame
+		# cost while a turret was firing; the cached sheets now see five or six
+		# frames per stage, not twenty-four.
+		var frame := (int(corpse.get("frame", 0.0)) / 8) * 8
+		# Four facings and three or four frames are enough to read as a
+		# decomposing body.  Resolving every direction and frame of the huge
+		# death sheets for a hundred corpses was the freeze during a fight.
+		var corpse_direction := (int(corpse.get("direction", 8)) / 4) * 4
+		var tag := "corpse/%s/%s" % [str(corpse.get("name", "")),
+			str(corpse.get("stage", "death"))]
+		for layer: SpriteSource.Layer in SpriteCache.layers(node,
+				corpse_direction, frame, 0, tag):
+			# Only the body layer: masks and shadows double the sheet count
+			# for no visual gain at corpse scale.
+			if layer.shadow or layer.runtime_tint:
+				continue
+			var modulate := layer.modulate
+			# The corpse sheets carry a decay fade in their alpha already.
+			var item := {
+				"texture": layer.texture,
+				"path": layer.reference,
+				"src": layer.src_rect,
+				"dest": Rect2(position + layer.offset - layer.size * 0.5,
+					layer.size),
+				"modulate": modulate,
+				"sort_y": position.y - 1.0,
+				"seq": _sequence,
+			}
+			_sequence += 1
+			if layer.shadow:
+				item["modulate"] = Color(modulate.r, modulate.g, modulate.b,
+					modulate.a * SHADOW_ALPHA)
+				shadows.append(item)
+			else:
+				bodies.append(item)
 
 
 ## Biters and spitters, drawn from their ``run_animation`` sheets.

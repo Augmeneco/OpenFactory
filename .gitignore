@@ -38,6 +38,7 @@
 /build/
 /dist/
 /.export_stage/
+/.export_stage_web/
 *.pck
 
 # Python tooling caches

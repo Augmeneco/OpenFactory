@@ -30,7 +30,7 @@ static func default_settings() -> Dictionary:
 		"moisture": 1.0,
 		"tree_density": 1.0,
 		"evolution_speed": 1.0,
-		"nest_distance": 14.0,
+		"nest_distance": 5.0,
 		"ores": ores,
 	}
 
@@ -107,7 +107,7 @@ func _build() -> void:
 	_add_slider(column, "Evolution speed", "evolution_speed",
 		0.25, 4.0, 0.05, 1.0, "x%.2f")
 	_add_slider(column, "Starting nest distance", "nest_distance",
-		0.0, 30.0, 1.0, 14.0, "%.0f chunks")
+		0.0, 30.0, 1.0, 5.0, "%.0f chunks")
 
 	var buttons := UiKit.row(8)
 	buttons.alignment = BoxContainer.ALIGNMENT_END

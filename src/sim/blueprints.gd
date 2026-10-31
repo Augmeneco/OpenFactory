@@ -72,7 +72,7 @@ static func size_of(blueprint: Dictionary) -> Vector2i:
 ## are waiting for materials, and how many cells were occupied by something
 ## else entirely.
 static func place(world: GameWorld, blueprint: Dictionary, origin: Vector2i,
-		inventory: Inventory = null) -> Dictionary:
+		inventory: Inventory = null, ghosts_only := false) -> Dictionary:
 	var built: Array = []
 	var ghosts: Array = []
 	var blocked: Array = []
@@ -92,6 +92,17 @@ static func place(world: GameWorld, blueprint: Dictionary, origin: Vector2i,
 		var occupant := world.entity_at(cell)
 		if occupant != null and not occupant.is_ghost():
 			blocked.append(cell)
+			continue
+
+		# Ctrl+V always lays plans, even if the player could afford them;
+		# construction robots (or a later click) do the building.
+		if ghosts_only:
+			var plan := Entity.create(proto_type, name, cell, direction)
+			_apply_state(plan, record)
+			if world.place_ghost(plan):
+				ghosts.append(cell)
+			else:
+				blocked.append(cell)
 			continue
 
 		var costs := costs_of(proto_type, name)
@@ -132,12 +143,65 @@ static func _apply_state(entity: Entity, record: Dictionary) -> void:
 		entity.state[key] = saved[key]
 
 
+## Build the ghost entities a blueprint would place, without touching the
+## world.  The paste preview and the real placement share this so the picture
+## and the result cannot disagree.
+static func preview(blueprint: Dictionary, origin: Vector2i) -> Array:
+	var out: Array = []
+	for entry: Variant in blueprint.get("entities", []):
+		if not (entry is Dictionary):
+			continue
+		var record: Dictionary = entry
+		var local: Variant = record.get("origin", [0, 0])
+		if not (local is Array) or (local as Array).size() < 2:
+			continue
+		var cell := origin + Vector2i(int(local[0]), int(local[1]))
+		var entity := Entity.create(str(record.get("type", "entity")),
+			str(record.get("name", "")), cell, int(record.get("direction", 0)))
+		if not entity.is_valid():
+			continue
+		_apply_state(entity, record)
+		out.append(entity)
+	return out
+
+
+## A record that can be stored on a deconstruction order and revived as a
+## ghost after the old building is gone.
+static func record_of(entity: Entity) -> Dictionary:
+	return {
+		"type": entity.proto_type, "name": entity.name,
+		"origin": [entity.origin.x, entity.origin.y],
+		"direction": entity.direction, "state": _state_of(entity),
+	}
+
+
 ## What one of a prototype costs to build, as a list of ``{ name, amount }``.
 ##
 ## Every ingredient of the recipe counts — a burner mining drill needs gear
 ## wheels, plates *and* a furnace — so a blueprint is only built where the
 ## inventory can cover the whole bill.
+static var _item_for_entity_cache: Dictionary = {}
+
+
+## The item a construction robot has to carry to build this entity.
+##
+## Blueprints used to ask for the *recipe ingredients* (iron plates and gears
+## for a belt), so a chest full of belts looked empty to every construction
+## robot.  Factorio ghosts are paid for with the placeable item itself.
+static func item_for_entity(name: String) -> String:
+	if _item_for_entity_cache.is_empty():
+		for item_name: String in Prototypes.all("item"):
+			var proto := Prototypes.item_proto(item_name)
+			var placed: Variant = proto.get("place_result")
+			if placed != null and not str(placed).is_empty():
+				_item_for_entity_cache[str(placed)] = item_name
+	return str(_item_for_entity_cache.get(name, ""))
+
+
 static func costs_of(proto_type: String, name: String) -> Array:
+	var item := item_for_entity(name)
+	if not item.is_empty():
+		return [{"name": item, "amount": 1}]
 	var out: Array = []
 	for recipe_name: String in Prototypes.all("recipe"):
 		var recipe := Prototypes.get_p("recipe", recipe_name)

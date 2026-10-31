@@ -29,12 +29,14 @@ const BELT_STRAIGHT := {0: 2, 4: 0, 8: 3, 12: 1}
 ## ``direction -> { right: row, left: row }``.  "Right" and "left" are the side
 ## of the belt the feeding line comes in on, seen from the belt's own heading.
 const BELT_CURVES := {
-	# Row 4 is the left turn E->N; row 5 is its mirror N->E.  The other
-	# pairs keep their original handedness.
-	0: {"right": 4, "left": 7},    # heading north: E->N, W->N
+	# Rows 4/5 connect E/N, 6/7 connect W/N, 8/9 connect S/E and 10/11
+	# connect S/W.  Within each pair the lower row is the entry from the
+	# first listed side: 4 E->N, 5 N->E, 6 W->N, 7 N->W, 8 S->E, 9 E->S,
+	# 10 S->W, 11 W->S.
+	0: {"right": 4, "left": 6},    # heading north: E->N, W->N
 	4: {"right": 8, "left": 5},    # heading east: S->E, N->E
-	8: {"right": 10, "left": 9},   # heading south: W->S, E->S
-	12: {"right": 6, "left": 11},  # heading west: N->W, S->W
+	8: {"right": 11, "left": 9},   # heading south: W->S, E->S
+	12: {"right": 7, "left": 10},  # heading west: N->W, S->W
 }
 
 
@@ -290,11 +292,35 @@ static func _base_visual(entity: Entity, frame := 0, world: GameWorld = null) ->
 					return _result([proto[key]], 0)
 
 		"ammo-turret", "electric-turret", "fluid-turret", "artillery-turret":
+			# A turret is a fixed base plus a gun that turns to follow its
+			# target.  Drawing only the folded/raising animation made the
+			# whole building look like it had no body.
+			var aim := int(entity.state.get("aim", entity.direction))
+			var nodes: Array = []
+			var tgs: Variant = proto.get("graphics_set", {})
+			if tgs is Dictionary and tgs.has("base_visualisation"):
+				var base_vis: Variant = tgs["base_visualisation"]
+				if base_vis is Dictionary and base_vis.has("animation"):
+					nodes.append(_direction_animation(base_vis["animation"], aim))
+				else:
+					nodes.append(_direction_animation(base_vis, aim))
+			var gun: Variant = proto.get("prepared_animation")
+			if gun == null:
+				gun = proto.get("attacking_animation")
+			if gun != null:
+				nodes.append(gun)
+			if not nodes.is_empty():
+				# Draw the gun's north-facing frame and rotate it ourselves.
+				# The sprite sheet's stripe/rotation layout is Factorio's
+				# counter-clockwise one; reusing it made east/west frames pick
+				# art that vanished behind the base.  A plain rotation is both
+				# simpler and always shows the tower.
+				var result := _result(nodes, 0)
+				result["rotate_nodes"] = {1: float(aim) * TAU / 16.0}
+				return result
 			for key in ["folded_animation", "preparing_animation"]:
 				if proto.has(key):
 					return _result([proto[key]], 0)
-			if proto.has("base_visualisation"):
-				return _result([proto["base_visualisation"]], 0)
 
 		"mining-drill":
 			var dgs: Variant = proto.get("graphics_set", {})
@@ -357,10 +383,23 @@ static func _base_visual(entity: Entity, frame := 0, world: GameWorld = null) ->
 					key = pipe_picture_key(world, entity)
 				var picked: Variant = ppic.get(key, ppic["straight_vertical_single"])
 				return _result([picked], 0)
-		"pipe-to-ground", "pump":
+		"pipe-to-ground":
+			# Unlike a normal pipe this one always draws whole: `pictures`
+			# is a compass table of the four above-ground ends, and the
+			# entity's direction picks the open side.  The old branch asked
+			# for a `straight_vertical_single` key that this prototype does
+			# not have, so every underground pipe looked like the same
+			# vertical stub.
 			var gpic: Variant = proto.get("pictures", {})
-			if gpic is Dictionary and gpic.has("straight_vertical_single"):
-				return _result([gpic["straight_vertical_single"]], 0)
+			if gpic is Dictionary:
+				var picked: Variant = _direction_animation(gpic, direction)
+				if picked != null:
+					return _result([picked], 0)
+
+		"pump":
+			var ppic: Variant = proto.get("pictures", {})
+			if ppic is Dictionary and ppic.has("straight_vertical_single"):
+				return _result([ppic["straight_vertical_single"]], 0)
 
 		"unit-spawner":
 			# Biter/spitter nests keep four idle animations under
@@ -644,11 +683,19 @@ static func belt_shape_row(world: GameWorld, belt: Entity) -> int:
 	var back := posmod(direction + 8, 16)
 	if _belt_feeds(world, belt, back):
 		return straight
-	for offset: int in [4, 12]:
-		var side := posmod(direction + offset, 16)
-		if _belt_feeds(world, belt, side):
-			var curves: Dictionary = BELT_CURVES.get(direction, {})
-			return int(curves.get("right" if offset == 4 else "left", straight))
+	# A belt fed from both sides is a merge, not a turn.  Drawing it as the
+	# first side's curve made the sprite bend into one lane even though items
+	# were arriving from both sides; Factorio keeps this case straight.
+	var right_feed := _belt_feeds(world, belt, posmod(direction + 4, 16))
+	var left_feed := _belt_feeds(world, belt, posmod(direction + 12, 16))
+	if right_feed and left_feed:
+		return straight
+	if right_feed:
+		var right_curves: Dictionary = BELT_CURVES.get(direction, {})
+		return int(right_curves.get("right", straight))
+	if left_feed:
+		var left_curves: Dictionary = BELT_CURVES.get(direction, {})
+		return int(left_curves.get("left", straight))
 	return straight
 
 

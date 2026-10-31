@@ -290,10 +290,15 @@ static func curve_input_side(world: GameWorld, belt: Entity) -> int:
 	var back := posmod(direction + 8, 16)
 	if _belt_feeds(world, belt, back):
 		return -1
-	for offset: int in [4, 12]:
-		var side := posmod(direction + offset, 16)
-		if _belt_feeds(world, belt, side):
-			return side
+	# Both sides feeding is a merge; the item path stays straight.
+	var right_feed := _belt_feeds(world, belt, posmod(direction + 4, 16))
+	var left_feed := _belt_feeds(world, belt, posmod(direction + 12, 16))
+	if right_feed and left_feed:
+		return -1
+	if right_feed:
+		return posmod(direction + 4, 16)
+	if left_feed:
+		return posmod(direction + 12, 16)
 	return -1
 
 

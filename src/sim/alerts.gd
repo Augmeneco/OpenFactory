@@ -9,37 +9,27 @@ extends RefCounted
 ## and builds the same list, so the panel can draw it and a click can jump the
 ## camera to the machine that is complaining.
 
-const NO_POWER := "no-power"
-const NO_FUEL := "no-fuel"
-const NO_AMMO := "no-ammo"
-const NO_FLUID := "no-fluid"
-const OUTPUT_FULL := "output-full"
 const DESTROYED := "destroyed"
+const DAMAGED := "damaged"
 const ENEMIES := "enemies"
+const NO_BUILDING_MATERIAL := "no-building-material"
 
 ## The real icon each alert uses, straight out of ``__core__``.
 const ICONS := {
-	NO_POWER: "__core__/graphics/icons/alerts/electricity-icon-red.png",
-	NO_FUEL: "__core__/graphics/icons/alerts/fuel-icon-red.png",
-	NO_AMMO: "__core__/graphics/icons/alerts/ammo-icon-red.png",
-	NO_FLUID: "__core__/graphics/icons/alerts/fluid-icon-red.png",
-	OUTPUT_FULL: "__core__/graphics/icons/alerts/destination-full-icon.png",
 	DESTROYED: "__core__/graphics/icons/alerts/destroyed-icon.png",
+	DAMAGED: "__core__/graphics/icons/alerts/warning-icon.png",
 	ENEMIES: "__core__/graphics/icons/alerts/danger-icon.png",
+	NO_BUILDING_MATERIAL: "__core__/graphics/icons/alerts/no-building-material-icon.png",
 }
 
-## How the panel orders them: what stops production first.
-const ORDER := [ENEMIES, DESTROYED, NO_POWER, NO_FLUID, NO_FUEL, NO_AMMO,
-	OUTPUT_FULL]
+## How the panel orders them: immediate danger first.
+const ORDER := [ENEMIES, DAMAGED, DESTROYED, NO_BUILDING_MATERIAL]
 
 const TITLES := {
-	NO_POWER: "No power",
-	NO_FUEL: "No fuel",
-	NO_AMMO: "No ammunition",
-	NO_FLUID: "Missing fluid",
-	OUTPUT_FULL: "Output full",
 	DESTROYED: "Destroyed",
+	DAMAGED: "Damaged",
 	ENEMIES: "Enemies nearby",
+	NO_BUILDING_MATERIAL: "Drones lack materials",
 }
 
 ## How often the world is walked, in ticks.
@@ -90,27 +80,33 @@ func update(world: GameWorld, sim: Simulation) -> bool:
 
 func _scan(world: GameWorld, sim: Simulation) -> Array:
 	var found: Array = []
+	# The sidebar is for things the player must act on, not a status mirror of
+	# every machine.  A missing power/fuel/ammo/output icon already appears on
+	# the entity itself; only damage and dangerous logistics get a global row.
 	for entity: Entity in world.entities.values():
 		if entity.is_ghost():
 			continue
-		var proto := entity.prototype()
-		if proto.is_empty():
+		if _is_damaged(entity):
+			var proto := entity.prototype()
+			found.append(_entry(DAMAGED, entity,
+				"%s is damaged" % Loc.proto_display_name(proto, entity.name)))
+	# Ghosts that no roboport can reach, or whose materials are absent from
+	# the network, are the construction-robot equivalent of a blocked machine.
+	for entity: Entity in world.entities.values():
+		if not entity.is_ghost():
 			continue
-		if _is_unpowered(entity, proto, sim):
-			found.append(_entry(NO_POWER, entity,
-				"%s has no power" % Loc.proto_display_name(proto, entity.name)))
-		if _is_out_of_fuel(entity, proto, sim):
-			found.append(_entry(NO_FUEL, entity,
-				"%s is out of fuel" % Loc.proto_display_name(proto, entity.name)))
-		if _is_out_of_ammo(entity, proto):
-			found.append(_entry(NO_AMMO, entity,
-				"%s is out of ammunition" % Loc.proto_display_name(proto, entity.name)))
-		if _is_missing_fluid(entity, sim):
-			found.append(_entry(NO_FLUID, entity,
-				"%s is missing a fluid" % Loc.proto_display_name(proto, entity.name)))
-		if _is_output_full(entity, proto):
-			found.append(_entry(OUTPUT_FULL, entity,
-				"%s has a full output" % Loc.proto_display_name(proto, entity.name)))
+		# No construction coverage means this ghost is simply not a robot job;
+		# it must not generate a global alert.  Only a covered ghost whose
+		# network cannot pay for it is a real logistics problem.
+		var network := sim.logistics.construction_network_at(entity.origin)
+		if network.is_empty():
+			continue
+		if not _network_can_pay(sim, network, entity):
+			found.append({
+				"kind": NO_BUILDING_MATERIAL, "cell": entity.origin,
+				"entity": entity,
+				"message": "Drones lack materials for %s" % entity.name,
+			})
 
 	for wreck: Dictionary in _wrecks:
 		var name := Loc.proto_name("item", str(wreck["name"])) \
@@ -122,6 +118,42 @@ func _scan(world: GameWorld, sim: Simulation) -> Array:
 
 	found.append_array(_enemy_alerts(sim))
 	return found
+
+
+## Something the biters (or fire) have already damaged.  Trees and rocks are
+## scenery and would flood the list after every forest fire.
+static func _is_damaged(entity: Entity) -> bool:
+	if entity.proto_type in ["tree", "simple-entity", "item-entity"]:
+		return false
+	var proto := entity.prototype()
+	var flags: Variant = proto.get("flags", [])
+	if flags is Array and not ((flags as Array).has("player-creation") \
+			or (flags as Array).has("placeable-player")):
+		return false
+	var max_health: Variant = proto.get("max_health", null)
+	if max_health == null or float(max_health) <= 0.0:
+		return false
+	var health: Variant = entity.state.get("health", null)
+	if health == null:
+		return false
+	return float(health) < float(max_health) - 0.01
+
+
+## Can the network's source chests pay for this ghost?
+static func _network_can_pay(sim: Simulation, network: Dictionary,
+		ghost: Entity) -> bool:
+	var costs := LogisticNetwork._ghost_costs(ghost)
+	if costs.is_empty():
+		return true
+	# Include the construction chests near the ghost, exactly like the robots
+	# do; otherwise a buildable plan would still raise "drones lack materials".
+	var chests: Array = []
+	for port: Entity in network.get("ports", []):
+		for chest: Entity in sim.logistics.builder_sources(port, ghost.origin,
+				costs):
+			if not chests.has(chest):
+				chests.append(chest)
+	return LogisticNetwork.chests_can_pay(chests, costs)
 
 
 static func _entry(kind: String, entity: Entity, message: String) -> Dictionary:

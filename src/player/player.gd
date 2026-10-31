@@ -52,6 +52,28 @@ var _mouse_right_down := false
 ## Ctrl-drag copy selection, in cells.
 var _copy_anchor := Vector2i.ZERO
 var _copy_dragging := false
+## True after Ctrl+C started a keyboard selection: the next left click
+## confirms it instead of starting a new drag.
+var _copy_selecting := false
+## Everything Ctrl+C copied, kept so Ctrl+V can paste it again later.
+var _clipboard_blueprint: Dictionary = {}
+## One entry per paste action: the ghost cells that action created.  Undo
+## removes a whole batch, never one machine at a time.
+var _undo_actions: Array = []
+const MAX_UNDO_ACTIONS := 40
+## Rail planner: the first click drops a rail, then a ghost route follows the
+## cursor until the next click lays the whole run.
+var _rail_planning := false
+var _rail_anchor: Entity
+var _rail_plan: Array = []
+var _rail_plan_cell := Vector2i(2147483647, 2147483647)
+## Ctrl+V paste preview: the blueprint follows the cursor until it is placed.
+var _paste_mode := false
+var _paste_blueprint: Dictionary = {}
+var _paste_cell := Vector2i(2147483647, 2147483647)
+var _paste_entities: Array = []
+var _paste_blockers: Array = []
+var _paste_terrain_ok := true
 ## Countdown to the next swing sound, so mining does not machine-gun.
 var _mining_swing := 0
 ## Wiring: "" when the hands are free, else the colour being run, plus the
@@ -62,6 +84,9 @@ var driving: Entity = null
 ## Gun chosen from the bottom-left weapon panel; empty means fall back to the
 ## quickbar/inventory search.
 var selected_weapon := ""
+## First ammo slot in the weapon panel: the round type this gun should use
+## when several magazines fit the same category.
+var preferred_ammo := ""
 var _wire_from: Entity = null
 var _copy_rect := Rect2i()
 
@@ -177,9 +202,9 @@ func tick(delta: float) -> void:
 		_tick_character(delta)
 
 	if touch_mode:
-		if _touch_primary >= 0:
-			_touch_update_hover(_touch_pos)
-		elif virtual_mouse_enabled:
+		# The crosshair belongs to the virtual pointer only; a finger pans or
+		# pinches the camera without moving the build cursor.
+		if virtual_mouse_enabled:
 			_touch_update_hover(virtual_mouse_position)
 	elif not (touch_mode and not _touch_points.is_empty()):
 		var mouse_world := camera.mouse_world_position()
@@ -187,6 +212,8 @@ func tick(delta: float) -> void:
 		hover_valid = _in_reach(hover_cell)
 	if _drag_building:
 		_tick_drag_building()
+	_tick_rail_plan()
+	_tick_paste()
 	_tick_mining(delta)
 	reposition_quickbar(get_viewport_rect().size)
 	queue_redraw()
@@ -194,7 +221,9 @@ func tick(delta: float) -> void:
 
 func _movement_input() -> Vector2:
 	var move := Vector2.ZERO
-	if input_blocked:
+	# The character screen is not modal in Factorio: the player keeps walking
+	# while it is open.  Other windows block movement through input_blocked.
+	if input_blocked and not inventory_open:
 		return move
 	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):
 		move.x -= 1.0
@@ -314,8 +343,9 @@ func _in_reach(cell: Vector2i) -> bool:
 ## The gesture timer: a stationary finger with an empty hand mines after a
 ## short hold.  Taps are handled on release so the same finger can still pan.
 func _tick_touch(delta: float) -> void:
-	if _touch_primary < 0 or _pinch_active:
-		return
+	# World mining/building belongs to the virtual mouse's LMB/RMB now.  A
+	# finger on the world only pans the camera or pinches to zoom.
+	return
 	if not _touch_points.has(_touch_primary):
 		return
 	_touch_elapsed += delta
@@ -370,7 +400,6 @@ func _handle_screen_drag(event: InputEventScreenDrag) -> void:
 		return
 	var delta := event.position - _touch_pos
 	_touch_pos = event.position
-	_touch_update_hover(event.position)
 	if event.position.distance_to(_touch_start) > 14.0:
 		_touch_moved = true
 	if not _touch_moved:
@@ -404,23 +433,8 @@ func _begin_touch(index: int, point: Vector2) -> void:
 	_touch_mining = false
 	_touch_camera_pan = false
 	_touch_building = false
-	_touch_update_hover(point)
-	if not hover_valid:
-		return
-	var held := held_item()
-	if held.is_empty():
-		return
-	_touch_acted = true
-	_drag_pointer_down = true
-	_drag_last = hover_cell
-	_drag_item = held
-	# Tapping an existing machine must not open it: opening is a double tap
-	# now, so a held item over a machine only remembers the target.
-	var existing := world.entity_at(hover_cell)
-	_drag_building = existing == null and _can_start_drag()
-	_touch_building = _drag_building
-	if existing == null:
-		build_at_cursor()
+	# Direct touches never build, mine or open anything.  Everything in the
+	# world goes through the virtual pointer and its LMB/RMB buttons.
 
 
 func _point_over_own_hud(point: Vector2) -> bool:
@@ -430,20 +444,15 @@ func _point_over_own_hud(point: Vector2) -> bool:
 	return false
 
 
-func _end_touch(point: Vector2) -> void:
-	_touch_update_hover(point)
+func _end_touch(_point: Vector2) -> void:
+	# A tap does nothing to the world; the virtual pointer's LMB/RMB are the
+	# only way to open, mine or build.
 	if _touch_mining and character != null:
 		character.cancel_mining()
-	var clean_tap := not _touch_moved and not _touch_camera_pan \
-		and not _touch_mining and not _touch_building \
-		and not input_blocked and hover_valid
-	var target: Entity = world.entity_at(hover_cell) if clean_tap else null
 	_touch_mining = false
 	_touch_building = false
 	_drag_building = false
 	_drag_pointer_down = false
-	if target != null:
-		_handle_entity_tap(target)
 	_touch_primary = -1
 	_touch_acted = false
 
@@ -671,8 +680,33 @@ var virtual_mouse_position := Vector2.ZERO
 var _virtual_mouse_mining := false
 
 
+## Clipboard shortcuts run before the UI's own Ctrl+Z/Ctrl+C handling.  When
+## they were read in _unhandled_input, Godot's built-in `ui_undo` swallowed
+## Ctrl+Z and the Game's Ctrl+C shot the gun instead of copying.
+func _input(event: InputEvent) -> void:
+	if input_blocked or not (event is InputEventKey):
+		return
+	var key := event as InputEventKey
+	if not key.pressed or key.echo or not key.ctrl_pressed:
+		return
+	match key.keycode:
+		KEY_C:
+			if hover_valid:
+				_copy_selecting = true
+				_copy_dragging = true
+				_copy_anchor = hover_cell
+				_copy_rect = Rect2i(hover_cell, Vector2i.ONE)
+				get_viewport().set_input_as_handled()
+		KEY_V:
+			begin_paste()
+			get_viewport().set_input_as_handled()
+		KEY_Z:
+			undo_last_ghosts()
+			get_viewport().set_input_as_handled()
+
+
 func _unhandled_input(event: InputEvent) -> void:
-	if input_blocked:
+	if input_blocked or inventory_open:
 		_drag_building = false
 		# While the character screen is open only a world mouse click passes;
 		# keys belong to the search box and the inventory itself.
@@ -695,6 +729,12 @@ func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseButton:
 		var button := event as InputEventMouseButton
 		if button.button_index == MOUSE_BUTTON_RIGHT:
+			if button.pressed and _paste_mode:
+				cancel_paste()
+				return
+			if button.pressed and _rail_planning:
+				cancel_rail_plan()
+				return
 			# A right click also puts the wire tool away, so a forgotten
 			# Ctrl+W cannot keep eating left clicks.
 			if button.pressed and not wire_colour.is_empty():
@@ -726,10 +766,21 @@ func _unhandled_input(event: InputEvent) -> void:
 			if button.button_index == MOUSE_BUTTON_LEFT:
 				_drag_building = false
 				_drag_pointer_down = false
-				if _copy_dragging:
+				if _copy_dragging and not _copy_selecting:
 					copy_drag(hover_cell, false)
 			return
 		if button.button_index == MOUSE_BUTTON_LEFT:
+			if _copy_selecting:
+				# Ctrl+C started at the anchor; the click is the opposite
+				# corner, even if no motion events arrived in between.
+				_copy_rect = Rect2i(
+					Vector2i(mini(_copy_anchor.x, hover_cell.x),
+						mini(_copy_anchor.y, hover_cell.y)),
+					Vector2i(absi(hover_cell.x - _copy_anchor.x) + 1,
+						absi(hover_cell.y - _copy_anchor.y) + 1))
+				_copy_selecting = false
+				copy_drag(hover_cell, false)
+				return
 			if not wire_colour.is_empty():
 				_wire_click()
 				return
@@ -775,10 +826,16 @@ func _unhandled_input(event: InputEvent) -> void:
 		elif key.keycode == KEY_R:
 			# R over a placed rotatable entity turns that entity; with bare
 			# ground it rotates the item being placed.
+			if _rail_planning:
+				cancel_rail_plan()
+				return
 			if not _rotate_entity_under_cursor():
 				build_direction = posmod(build_direction + 4, 16)
 			queue_redraw()
 		elif key.keycode == KEY_Q:
+			if _paste_mode:
+				cancel_paste()
+				return
 			# Q clears the hand wherever the player is; with an empty hand it
 			# picks the item under the cursor (and only then needs a target).
 			if not cursor_item.is_empty():
@@ -961,6 +1018,13 @@ func ammo_for(gun_name: String) -> String:
 	if gun.is_empty():
 		return ""
 	var category := str(gun.get("attack_parameters", {}).get("ammo_category", ""))
+	# The first ammo slot in the weapon panel is the preferred round as long
+	# as it still fits the selected gun.
+	if not preferred_ammo.is_empty() and inventory.count_of(preferred_ammo) > 0:
+		var preferred := Prototypes.get_p("ammo", preferred_ammo)
+		if not preferred.is_empty() \
+				and str(preferred.get("ammo_category", "")) == category:
+			return preferred_ammo
 	for slot: Variant in inventory.slots:
 		if slot == null:
 			continue
@@ -1280,18 +1344,168 @@ static func is_rolling_stock(item_name: String) -> bool:
 ## rail.  R still rotates the preferred straight/axis; the curve choice is
 ## automatic because Factorio's rail planner also joins tracks rather than
 ## asking for a separate curve item.
-func _place_rail_at(cell: Vector2i, item_name: String) -> bool:
+func _place_rail_at(cell: Vector2i, item_name: String) -> Entity:
 	var best := _best_rail_candidate(cell)
 	if best == null:
-		return false
+		return null
 	if not world.place_entity(best):
-		return false
+		return null
 	consume_held(item_name)
 	if simulation != null:
 		simulation.mark_power_dirty()
 	_play_build_sound(best)
 	built.emit(best)
-	return true
+	return best
+
+
+## Keep the rail ghost route in step with the cursor.
+func _tick_rail_plan() -> void:
+	if not _rail_planning:
+		return
+	var item_name := held_item()
+	if _rail_anchor == null or not is_instance_valid(_rail_anchor) \
+			or placeable_type(item_name) not in [
+				"straight-rail", "curved-rail-a", "curved-rail-b"]:
+		cancel_rail_plan()
+		return
+	if hover_cell == _rail_plan_cell and not _rail_plan.is_empty():
+		return
+	_rail_plan_cell = hover_cell
+	_rail_plan = _plan_rail_path(_rail_anchor, hover_cell)
+
+
+func cancel_rail_plan() -> void:
+	_rail_planning = false
+	_rail_anchor = null
+	_rail_plan.clear()
+	_rail_plan_cell = Vector2i(2147483647, 2147483647)
+
+
+## Lay the previewed run.  Rails go down while the player still holds them;
+## the rest of the plan becomes ghosts so a long route is not lost.
+func _commit_rail_plan(item_name: String) -> void:
+	if not _rail_planning or _rail_plan.is_empty():
+		cancel_rail_plan()
+		return
+	var last: Entity = null
+	for candidate: Entity in _rail_plan:
+		if candidate == null or not candidate.is_valid():
+			continue
+		var cell_ok := world.can_place_terrain(candidate) \
+			and world.can_place(candidate)
+		if not cell_ok:
+			break
+		if held_count(item_name) > 0:
+			if not world.place_entity(candidate):
+				break
+			consume_held(item_name)
+			if simulation != null:
+				simulation.mark_power_dirty()
+			built.emit(candidate)
+			last = candidate
+			continue
+		var ghost := Entity.create(candidate.proto_type, candidate.name,
+			candidate.origin, candidate.direction)
+		if not world.place_ghost(ghost):
+			break
+		last = ghost
+	if last != null:
+		_rail_anchor = last
+		_rail_plan.clear()
+		_rail_plan_cell = Vector2i(2147483647, 2147483647)
+		_play_build_sound(last)
+	else:
+		cancel_rail_plan()
+	inventory_changed.emit()
+
+
+## A greedy rail route from ``from_rail`` towards ``target_cell``.
+##
+## The planner only needs a readable preview: at every endpoint it picks the
+## next piece that actually connects (same point, same heading) and makes the
+## most progress towards the cursor.  Curves appear automatically because they
+## are the only pieces that can turn.
+func _plan_rail_path(from_rail: Entity, target_cell: Vector2i) -> Array:
+	var out: Array = []
+	var target := Vector2(target_cell) + Vector2(0.5, 0.5)
+	var current: Entity = from_rail
+	var occupied: Dictionary = {}
+	for cell: Vector2i in from_rail.occupied_cells():
+		occupied[cell] = true
+	var visited: Dictionary = {}
+	for step in 40:
+		var path := RailGeometry.path_of(current)
+		if path.is_empty():
+			break
+		var endpoint := Vector2(path["end"])
+		if endpoint.distance_to(target) <= 1.6:
+			break
+		var heading := int(path["end_dir"])
+		var to_target := (target - endpoint).normalized()
+		var current_dist := endpoint.distance_to(target)
+		var end_cell := Vector2i(int(floor(endpoint.x)), int(floor(endpoint.y)))
+		var best: Entity = null
+		var best_score := -INF
+		var best_dist := current_dist
+		for dy in range(-2, 3):
+			for dx in range(-2, 3):
+				var cell := end_cell + Vector2i(dx, dy)
+				for piece_name: String in ["straight-rail", "curved-rail-a",
+						"curved-rail-b"]:
+					for direction in [0, 4, 8, 12]:
+						var key := "%s|%d|%d|%d" % [piece_name, cell.x, cell.y,
+							direction]
+						if visited.has(key):
+							continue
+						var candidate := Entity.create(piece_name, piece_name,
+							cell, direction)
+						var cpath := RailGeometry.path_of(candidate)
+						if cpath.is_empty():
+							continue
+						if Vector2(cpath["start"]).distance_to(endpoint) > 0.05:
+							continue
+						if int(cpath["start_dir"]) != heading:
+							continue
+						var to_end: Vector2 = Vector2(cpath["end"]) - endpoint
+						if to_end.length() < 0.1:
+							continue
+						var dist: float = Vector2(cpath["end"]).distance_to(target)
+						if dist > current_dist + 1.2:
+							continue
+						# A planned piece must not overlap the anchor or the
+						# rest of the run; otherwise the ghost line would show
+						# treble clefs that cannot be built.
+						var blocked := false
+						for occupied_cell: Vector2i in candidate.occupied_cells():
+							if occupied.has(occupied_cell):
+								blocked = true
+								break
+						if blocked:
+							continue
+						var align := to_end.normalized().dot(to_target)
+						if align < -0.25 and dist > current_dist - 0.2:
+							continue
+						if not world.can_place_terrain(candidate) \
+								or not world.can_place(candidate):
+							continue
+						var score := -dist + align * 0.5
+						if piece_name != "straight-rail":
+							score -= 0.15
+						if dist <= 1.6:
+							score += 10.0
+						if score > best_score:
+							best_score = score
+							best = candidate
+							best_dist = dist
+		if best == null:
+			break
+		visited["%s|%d|%d|%d" % [best.proto_type, best.origin.x,
+			best.origin.y, best.direction]] = true
+		for cell: Vector2i in best.occupied_cells():
+			occupied[cell] = true
+		out.append(best)
+		current = best
+	return out
 
 
 ## The rail piece the planner would put at ``cell`` right now.  The preview
@@ -1584,6 +1798,9 @@ func _tick_drag_building() -> void:
 func build_at_cursor() -> void:
 	if not hover_valid:
 		return
+	if _paste_mode:
+		_commit_paste()
+		return
 	# Shift puts the plan down rather than the machine, which is how a
 	# blueprint is laid out by hand.
 	if Input.is_key_pressed(KEY_SHIFT):
@@ -1613,9 +1830,19 @@ func build_at_cursor() -> void:
 		if existing.proto_type == "item-entity":
 			_pick_up_ground_item(existing)
 			return
-		# A ghost under the cursor is a request to build it for real.
+		# A ghost is a plan, not a machine.  Clicking it with the matching
+		# item builds it; otherwise the click opens the plan's window, where
+		# recipe, requests and filters can be set before it is ever built.
 		if existing.is_ghost():
-			revive_ghost_at(existing)
+			var ghost_item := held_item()
+			var ghost_type := str(existing.state.get(
+				"ghost_of", existing.proto_type))
+			if not ghost_item.is_empty() \
+					and placeable_type(ghost_item) == ghost_type \
+					and held_count(ghost_item) > 0:
+				revive_ghost_at(existing)
+			else:
+				entity_activated.emit(existing)
 			return
 		# Belts are floor furniture: clicking one must not open a machine
 		# window.  Mining is still the right mouse button.
@@ -1644,7 +1871,26 @@ func build_at_cursor() -> void:
 	if proto_type.is_empty():
 		return
 	if proto_type in ["straight-rail", "curved-rail-a", "curved-rail-b"]:
-		_place_rail_at(hover_cell, item_name)
+		# A rail click starts the planner; the next click lays the whole run
+		# previewed between the anchor and the cursor.
+		if _rail_planning:
+			if _rail_plan.is_empty():
+				# Too close for a run: add one more piece on the spot.
+				var next := _place_rail_at(hover_cell, item_name)
+				if next != null:
+					_rail_anchor = next
+					_rail_plan_cell = Vector2i(2147483647, 2147483647)
+				else:
+					cancel_rail_plan()
+			else:
+				_commit_rail_plan(item_name)
+			return
+		var first := _place_rail_at(hover_cell, item_name)
+		if first != null:
+			_rail_planning = true
+			_rail_anchor = first
+			_rail_plan.clear()
+			_rail_plan_cell = Vector2i(2147483647, 2147483647)
 		return
 	# The entity a thing places is not always named after the thing: the rail
 	# planner's item is "rail" but the rail is "straight-rail".
@@ -1744,6 +1990,7 @@ func place_ghost_at_cursor() -> void:
 		return
 	FactorioAudio.play_utility("build_ghost_upgrade", entity.center())
 	simulation.mark_power_dirty()
+	_record_undo([hover_cell])
 	blueprint_placed.emit({"built": [], "ghosts": [hover_cell], "blocked": []})
 
 
@@ -1757,6 +2004,7 @@ func place_blueprint_at(origin: Vector2i) -> void:
 	simulation.mark_power_dirty()
 	simulation.fluids.mark_dirty()
 	simulation.logistics.mark_dirty()
+	_record_undo(result["ghosts"])
 	blueprint_placed.emit(result)
 	inventory_changed.emit()
 	if (result["ghosts"] as Array).is_empty():
@@ -1809,16 +2057,10 @@ func copy_drag(cell: Vector2i, pressed: bool) -> void:
 	if not _copy_dragging:
 		return
 	_copy_dragging = false
+	_copy_selecting = false
 	if _copy_rect.size.x < 1 or _copy_rect.size.y < 1:
 		return
-	var blueprint := Blueprints.capture(world, _copy_rect)
-	print("copied %d entities in a %dx%d blueprint" % [
-		(blueprint["entities"] as Array).size(), _copy_rect.size.x,
-		_copy_rect.size.y])
-	# The blueprint goes onto the cursor, ready to paste, exactly as Factorio
-	# hands you the item.
-	cursor_item = {"name": Blueprints.ITEM, "count": 1, "blueprint": blueprint}
-	inventory_changed.emit()
+	copy_rect_now(_copy_rect)
 
 
 func copy_rect() -> Rect2i:
@@ -1827,6 +2069,189 @@ func copy_rect() -> Rect2i:
 
 func copy_dragging() -> bool:
 	return _copy_dragging
+
+
+## Ctrl+C: copy the last dragged rectangle, or a single tile under the cursor.
+func copy_selection_at(cell: Vector2i) -> void:
+	var rect := Rect2i(cell, Vector2i.ONE)
+	if _copy_rect.size.x > 0 and _copy_rect.size.y > 0:
+		rect = _copy_rect
+	copy_rect_now(rect)
+
+
+## Capture a rectangle into the clipboard and onto the cursor.
+func copy_rect_now(rect: Rect2i) -> void:
+	var blueprint := Blueprints.capture(world, rect)
+	_clipboard_blueprint = blueprint
+	print("copied %d entities in a %dx%d blueprint" % [
+		(blueprint["entities"] as Array).size(), rect.size.x, rect.size.y])
+	cursor_item = {"name": Blueprints.ITEM, "count": 1,
+		"blueprint": blueprint}
+	inventory_changed.emit()
+
+
+## Ctrl+V: the clipboard follows the cursor until a click places it.
+func begin_paste() -> void:
+	if _clipboard_blueprint.is_empty():
+		return
+	_paste_mode = true
+	_paste_blueprint = _clipboard_blueprint.duplicate(true)
+	_paste_cell = Vector2i(2147483647, 2147483647)
+	_paste_entities.clear()
+	_paste_blockers.clear()
+	_paste_terrain_ok = true
+	if hover_valid:
+		_rebuild_paste()
+
+
+func cancel_paste() -> void:
+	_paste_mode = false
+	_paste_blueprint = {}
+	_paste_entities.clear()
+	_paste_blockers.clear()
+	_paste_cell = Vector2i(2147483647, 2147483647)
+
+
+func paste_preview_active() -> bool:
+	return _paste_mode
+
+
+## Keep the ghost blueprint under the cursor and work out whether it fits.
+func _tick_paste() -> void:
+	if not _paste_mode:
+		return
+	if hover_cell == _paste_cell:
+		return
+	if not hover_valid:
+		_paste_cell = Vector2i(2147483647, 2147483647)
+		_paste_entities.clear()
+		_paste_blockers.clear()
+		return
+	_rebuild_paste()
+
+
+func _rebuild_paste() -> void:
+	_paste_cell = hover_cell
+	_paste_entities = Blueprints.preview(_paste_blueprint, hover_cell)
+	_paste_blockers.clear()
+	_paste_terrain_ok = true
+	var seen: Dictionary = {}
+	for entity: Entity in _paste_entities:
+		if not world.can_place_terrain(entity):
+			_paste_terrain_ok = false
+		for cell: Vector2i in entity.occupied_cells():
+			var occupant := world.entity_at(cell)
+			if occupant == null or occupant.is_ghost():
+				continue
+			if seen.has(occupant.origin):
+				continue
+			seen[occupant.origin] = true
+			_paste_blockers.append(occupant)
+
+
+## Place the ghost blueprint.  Shift turns anything in the way into a
+## deconstruction mark; the ghost is left there for the robots to build after
+## the old building is gone.
+func _commit_paste(force_shift := false) -> void:
+	if not _paste_mode:
+		return
+	_rebuild_paste()
+	if not _paste_terrain_ok or _paste_entities.is_empty():
+		FactorioAudio.play_utility("cannot_build", Vector2(hover_cell))
+		return
+	var shift := force_shift or Input.is_key_pressed(KEY_SHIFT)
+	if not _paste_blockers.is_empty() and not shift:
+		FactorioAudio.play_utility("cannot_build", Vector2(hover_cell))
+		return
+
+	var by_cell: Dictionary = {}
+	for blocker: Entity in _paste_blockers:
+		for cell: Vector2i in blocker.occupied_cells():
+			by_cell[cell] = blocker
+	var followups: Dictionary = {}
+	var ghosts: Array = []
+	for planned: Entity in _paste_entities:
+		var blocker: Entity = null
+		for cell: Vector2i in planned.occupied_cells():
+			if by_cell.has(cell):
+				blocker = by_cell[cell]
+				break
+		if blocker != null:
+			# The ghost cannot share the cell; remember it on the mark so the
+			# robot leaves the plan behind after taking the building apart.
+			followups[blocker.origin] = Blueprints.record_of(planned)
+			continue
+		var existing := world.entity_at(planned.origin)
+		if existing != null and existing.is_ghost():
+			world.remove_entity(existing)
+		if world.place_ghost(planned):
+			ghosts.append(planned.origin)
+
+	if simulation != null:
+		for blocker: Entity in _paste_blockers:
+			simulation.logistics.mark_deconstruction(blocker,
+				followups.get(blocker.origin, {}))
+		simulation.mark_power_dirty()
+		simulation.logistics.mark_dirty()
+	blueprint_placed.emit({"built": [], "ghosts": ghosts,
+		"blocked": _paste_blockers.size()})
+	inventory_changed.emit()
+	cancel_paste()
+
+
+func _draw_paste_preview() -> void:
+	if _paste_entities.is_empty():
+		return
+	var shift := Input.is_key_pressed(KEY_SHIFT)
+	var blocked := not _paste_terrain_ok or not _paste_blockers.is_empty()
+	var tint := Color(0.65, 1.0, 0.7, 0.4)
+	if blocked and not shift:
+		tint = Color(1.0, 0.35, 0.3, 0.35)
+	elif blocked and shift:
+		tint = Color(1.0, 0.78, 0.25, 0.4)
+	for entity: Entity in _paste_entities:
+		_draw_preview_entity(entity, tint)
+
+func clipboard_blueprint() -> Dictionary:
+	return _clipboard_blueprint
+
+
+## Remember the ghosts one action created.  A big paste is one entry, so one
+## Ctrl+Z removes the whole pasted block instead of a machine at a time.
+func _record_undo(cells: Variant) -> void:
+	if not (cells is Array) or (cells as Array).is_empty():
+		return
+	var batch: Array = []
+	for cell: Variant in cells:
+		if cell is Vector2i:
+			batch.append(cell)
+	if batch.is_empty():
+		return
+	_undo_actions.append(batch)
+	if _undo_actions.size() > MAX_UNDO_ACTIONS:
+		_undo_actions.pop_front()
+
+
+## Ctrl+Z: remove the ghosts of the last paste/ghost action.
+func undo_last_ghosts() -> int:
+	while not _undo_actions.is_empty():
+		var batch: Array = _undo_actions.pop_back()
+		var removed := 0
+		for cell: Vector2i in batch:
+			var entity := world.entity_at(cell)
+			if entity != null and entity.is_ghost():
+				world.remove_entity(entity)
+				removed += 1
+		if removed > 0:
+			if simulation != null:
+				simulation.mark_power_dirty()
+				simulation.fluids.mark_dirty()
+				simulation.logistics.mark_dirty()
+			blueprint_placed.emit({"built": [], "ghosts": [], "blocked": [],
+				"undone": removed})
+			inventory_changed.emit()
+			return removed
+	return 0
 
 
 func mine_at_cursor() -> void:
@@ -1970,6 +2395,9 @@ func pick_from_cursor() -> void:
 ## would be built.  Factorio shows this faintly, tinted by whether it can go
 ## there at all, and it is the only way to see what R is doing.
 func _draw_build_preview() -> void:
+	if _paste_mode:
+		_draw_paste_preview()
+		return
 	var item_name := held_item()
 	if item_name.is_empty() or is_rolling_stock(item_name):
 		return
@@ -1979,6 +2407,10 @@ func _draw_build_preview() -> void:
 		return
 	var proto_type := placeable_type(item_name)
 	if proto_type.is_empty():
+		return
+	if _rail_planning and proto_type in ["straight-rail", "curved-rail-a",
+			"curved-rail-b"]:
+		_draw_rail_plan(item_name)
 		return
 	var entity: Entity
 	if proto_type in ["straight-rail", "curved-rail-a", "curved-rail-b"]:
@@ -1998,7 +2430,24 @@ func _draw_build_preview() -> void:
 		tint = Color(1.0, 0.35, 0.3, 0.35)
 	else:
 		tint = Color(0.65, 1.0, 0.7, 0.4)
+	_draw_preview_entity(entity, tint)
 
+
+## One translucent rail of the planned run.
+func _draw_rail_plan(item_name: String) -> void:
+	if _rail_plan.is_empty():
+		return
+	var tint := Color(0.65, 1.0, 0.7, 0.4)
+	if held_count(item_name) <= 0:
+		tint = Color(0.45, 0.6, 1.0, 0.35)
+	for candidate: Entity in _rail_plan:
+		if candidate == null or not candidate.is_valid():
+			continue
+		_draw_preview_entity(candidate, tint)
+
+
+## Draw one entity as a building preview in a tint.
+func _draw_preview_entity(entity: Entity, tint: Color) -> void:
 	var data := EntityVisuals.visual(entity, 0, world)
 	if data.is_empty():
 		# Some things have no art to preview, so show the footprint instead.
@@ -2170,19 +2619,26 @@ func _draw_underground_link() -> void:
 	if simulation == null:
 		return
 	var entity := world.entity_at(hover_cell)
-	if entity == null or entity.is_ghost() \
-			or entity.proto_type != "underground-belt":
+	if entity == null or entity.is_ghost():
 		return
-	var other := simulation.underground_link(entity)
+	var is_belt := entity.proto_type == "underground-belt"
+	var is_pipe := entity.proto_type == "pipe-to-ground"
+	if not is_belt and not is_pipe:
+		return
+	var other: Entity = simulation.underground_link(entity) if is_belt \
+		else simulation.underground_pipe_link(entity)
 	if other == null:
 		return
-	var entrance := entity
-	var exit := other
-	if str(entity.state.get("io", "input")) == "output":
-		entrance = other
-		exit = entity
-	var from := entrance.center() * TILE
-	var to := exit.center() * TILE
+	var from := entity.center() * TILE
+	var to := other.center() * TILE
+	if is_belt:
+		var entrance := entity
+		var exit := other
+		if str(entity.state.get("io", "input")) == "output":
+			entrance = other
+			exit = entity
+		from = entrance.center() * TILE
+		to = exit.center() * TILE
 	var colour := Color(1.0, 0.82, 0.1, 0.95)
 	var delta := to - from
 	var distance := delta.length()
@@ -2197,14 +2653,17 @@ func _draw_underground_link() -> void:
 			from + direction * minf(at + step * 0.65, distance),
 			colour, 2.5, true)
 		at += step * 1.55
-	for fraction: float in [0.35, 0.7]:
-		var tip := from + delta * fraction
-		var side := Vector2(-direction.y, direction.x)
-		draw_colored_polygon(PackedVector2Array([
-			tip + direction * 7.0,
-			tip - direction * 4.0 + side * 5.0,
-			tip - direction * 4.0 - side * 5.0,
-		]), colour)
+	# Underground belts have a travel direction, so the line gets arrowheads.
+	# Pipes are bidirectional; the dashed shaft and end boxes are enough.
+	if is_belt:
+		for fraction: float in [0.35, 0.7]:
+			var tip := from + delta * fraction
+			var side := Vector2(-direction.y, direction.x)
+			draw_colored_polygon(PackedVector2Array([
+				tip + direction * 7.0,
+				tip - direction * 4.0 + side * 5.0,
+				tip - direction * 4.0 - side * 5.0,
+			]), colour)
 	# Mark both ends so it is obvious which tiles the tunnel joins.
 	for point: Vector2 in [from, to]:
 		draw_rect(Rect2(point - Vector2(TILE, TILE) * 0.5,
@@ -2693,6 +3152,35 @@ func craft(recipe_name: String, count := 1) -> int:
 		craft_queue.append_array(tasks)
 		inventory_changed.emit()
 	return made
+
+
+## Cancel the whole hand-crafting queue and refund the ingredients of the
+## craft that had already started.  Queued-but-not-started tasks never spent
+## their ingredients, so they need no refund.
+func cancel_crafting() -> int:
+	if craft_queue.is_empty():
+		return 0
+	var cancelled := craft_queue.size()
+	var head: Dictionary = craft_queue[0]
+	if bool(head.get("started", false)):
+		var recipe := Prototypes.get_p("recipe", str(head.get("recipe", "")))
+		var runs := maxi(1, int(head.get("count", 1)))
+		if not recipe.is_empty():
+			for ingredient: Dictionary in Prototypes.recipe_ingredients(recipe):
+				if str(ingredient.get("type", "item")) != "item":
+					continue
+				var name := str(ingredient.get("name", ""))
+				var amount := int(ingredient.get("amount", 0)) * runs
+				if name.is_empty() or amount <= 0:
+					continue
+				var leftover := inventory.insert(name, amount)
+				if leftover > 0 and simulation != null and character != null:
+					# Inventory full: put the rest on the ground under the
+					# engineer instead of silently deleting it.
+					simulation._drop_on_ground(character.cell(), name, leftover)
+	craft_queue.clear()
+	inventory_changed.emit()
+	return cancelled
 
 
 ## Build the recipe graph once.  Recipes are not all hand-craftable in every

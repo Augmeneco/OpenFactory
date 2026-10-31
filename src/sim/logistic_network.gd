@@ -33,7 +33,19 @@ var robots: Array = []
 ## Construction robots, which have their own list because they answer to
 ## ghosts rather than to chests.
 var builders: Array = []
+## Marked for removal.  ``followup`` is the blueprint record of what should
+## stand there afterwards, so shift-paste with a plan on top of a building
+## works in one gesture.
+var deconstruction: Array = []
 var _dirty := true
+## Construction ghost scans are the expensive part of the network tick.  They
+## run a few times a second, not 60 times, so a field of unbuildable plans does
+## not eat the frame budget.
+var _dispatch_cooldown := 0
+## Port origin -> {at, chests}; construction chests are scanned once every
+## half second instead of once per ghost.
+var _nearby_cache: Dictionary = {}
+var _clock := 0
 
 var _networks: Array = []
 
@@ -44,6 +56,37 @@ func _init(world_: GameWorld) -> void:
 
 func mark_dirty() -> void:
 	_dirty = true
+	_nearby_cache.clear()
+
+
+## Mark one building for a construction robot to take apart.
+func mark_deconstruction(entity: Entity, followup: Dictionary = {}) -> bool:
+	if entity == null or entity.is_ghost():
+		return false
+	if not world.entities.has(entity.origin):
+		return false
+	for order: Dictionary in deconstruction:
+		if int(order.get("origin_x", 0)) == entity.origin.x \
+				and int(order.get("origin_y", 0)) == entity.origin.y:
+			order["entity"] = entity
+			order["followup"] = followup
+			return true
+	deconstruction.append({
+		"entity": entity,
+		"origin_x": entity.origin.x,
+		"origin_y": entity.origin.y,
+		"followup": followup,
+		"claimed": false,
+	})
+	return true
+
+
+func deconstruction_at(cell: Vector2i) -> bool:
+	for order: Dictionary in deconstruction:
+		if int(order.get("origin_x", 0)) == cell.x \
+				and int(order.get("origin_y", 0)) == cell.y:
+			return true
+	return false
 
 
 func stats() -> Dictionary:
@@ -60,6 +103,7 @@ func stats() -> Dictionary:
 		"charging": charging,
 		"builders": builders.size(),
 		"built": _built,
+		"deconstructed": _deconstructed,
 		"delivered": _delivered,
 		"networks": _networks.size(),
 	}
@@ -67,6 +111,7 @@ func stats() -> Dictionary:
 
 var _delivered := 0
 var _built := 0
+var _deconstructed := 0
 
 
 # --------------------------------------------------------------------------
@@ -162,6 +207,21 @@ func network_of(port: Entity) -> Dictionary:
 	for network: Dictionary in _networks:
 		if (network["ports"] as Array).has(port):
 			return network
+	return {}
+
+
+## The network whose construction robots can reach a point.  This is a
+## different radius from logistics coverage: a ghost outside every roboport's
+## construction area simply cannot be built by robots and should not raise an
+## alert at all.
+func construction_network_at(cell: Vector2i) -> Dictionary:
+	if _dirty:
+		rebuild()
+	for network: Dictionary in _networks:
+		for port: Entity in network["ports"]:
+			if port.center().distance_to(Vector2(cell) + Vector2(0.5, 0.5)) \
+					<= construction_radius(port):
+				return network
 	return {}
 
 
@@ -279,6 +339,7 @@ func _assign(robot: Dictionary, pickup: Entity, dropoff: Entity, item: String,
 # --------------------------------------------------------------------------
 
 func update() -> void:
+	_clock += 1
 	if _dirty:
 		rebuild()
 	# A personal roboport needs no network at all, so an empty world with one
@@ -288,7 +349,11 @@ func update() -> void:
 			and not _has_personal_roboport():
 		return
 	_dispatch()
-	_dispatch_builders()
+	_dispatch_cooldown -= 1
+	if _dispatch_cooldown <= 0:
+		_dispatch_cooldown = 6
+		_dispatch_deconstruction()
+		_dispatch_builders()
 	_dispatch_personal()
 	_fly()
 	_fly_builders()
@@ -441,8 +506,60 @@ func _free_builder(port: Entity) -> Dictionary:
 ## Factorio keeps a ghost queue and hands jobs out to whatever robot is free;
 ## the same shape works here — a ghost with a robot already heading for it is
 ## skipped, so two robots never race for one plan.
+## Send robots to the red marks first: removing a building frees the cell a
+## shift-pasted ghost is waiting for.
+func _dispatch_deconstruction() -> void:
+	if deconstruction.is_empty() or _networks.is_empty():
+		return
+	var alive: Array = []
+	for order: Dictionary in deconstruction:
+		var entity: Variant = order.get("entity")
+		if not (entity is Entity) or not world.entities.has((entity as Entity).origin):
+			continue
+		alive.append(order)
+	deconstruction = alive
+	var claimed: Dictionary = {}
+	for robot: Dictionary in builders:
+		var task: Dictionary = robot.get("task", {})
+		if task.has("deconstruct"):
+			claimed[str(task["deconstruct"])] = true
+	for order: Dictionary in deconstruction:
+		order["claimed"] = false
+	for order: Dictionary in deconstruction:
+		if bool(order.get("claimed", false)):
+			continue
+		var entity: Entity = order["entity"]
+		var key := str(entity.origin)
+		if claimed.has(key):
+			continue
+		var network := construction_network_at(entity.origin)
+		if network.is_empty():
+			continue
+		var assigned := false
+		for port: Entity in network["ports"]:
+			if port.center().distance_to(entity.center()) > construction_radius(port):
+				continue
+			var robot := _free_builder(port)
+			if robot.is_empty():
+				continue
+			robot["state"] = "deconstruct"
+			robot["task"] = {"deconstruct": entity.origin, "home": port.origin}
+			order["claimed"] = true
+			claimed[key] = true
+			assigned = true
+			break
+		if assigned:
+			continue
+
+
 func _dispatch_builders() -> void:
 	if _networks.is_empty():
+		return
+	var ghosts: Array = []
+	for entity: Entity in world.entities.values():
+		if entity.is_ghost():
+			ghosts.append(entity)
+	if ghosts.is_empty():
 		return
 	var claimed: Dictionary = {}
 	for robot: Dictionary in builders:
@@ -452,12 +569,32 @@ func _dispatch_builders() -> void:
 
 	for network: Dictionary in _networks:
 		for port: Entity in network["ports"]:
-			for ghost: Entity in _ghosts_for(port):
+			var reach := construction_radius(port)
+			var centre := port.center()
+			# The fallback chests are collected once per port instead of once
+			# per ghost; with hundreds of ghosts the old scan was the frame
+			# time by itself.
+			var nearby: Array = []
+			for chest: Entity in world.entities_of_type("logistic-container"):
+				if chest.is_ghost() or source_rank(chest) < 0:
+					continue
+				if chest.center().distance_to(centre) <= reach:
+					nearby.append(chest)
+			for ghost: Entity in ghosts:
 				if claimed.has(str(ghost.origin)):
+					continue
+				if centre.distance_to(ghost.center()) > reach:
+					continue
+				var costs := _ghost_costs(ghost)
+				var sources := builder_sources(port, ghost.origin, costs,
+					nearby, true)
+				if not chests_can_pay(sources, costs):
 					continue
 				var robot := _free_builder(port)
 				if robot.is_empty():
-					continue
+					# All slots are full; no point walking the rest of the
+					# list this tick.
+					break
 				robot["state"] = "ghost"
 				robot["task"] = {"ghost": ghost.origin, "home": port.origin}
 				claimed[str(ghost.origin)] = true
@@ -473,14 +610,22 @@ static func _ghost_costs(ghost: Entity) -> Array:
 ##
 ## Factorio's construction robots take from the logistic network, not from the
 ## player, so the chests are searched the way a requester's request would be.
-func _withdraw(port: Entity, costs: Array) -> bool:
+## Whether the network's source chests hold every ingredient of a job.
+##
+## Checked before anything is taken: withdrawing one ingredient and then
+## discovering the next is missing used to drain chests without ever building
+## the machine.
+func network_can_pay(network: Dictionary, costs: Array) -> bool:
+	return chests_can_pay(network.get("chests", []), costs)
+
+
+static func chests_can_pay(chests: Array, costs: Array) -> bool:
 	if costs.is_empty():
 		return true
-	var network := network_of(port)
 	for cost: Dictionary in costs:
-		var wanted := int(cost["amount"])
 		var item := str(cost["name"])
-		for chest: Entity in network.get("chests", []):
+		var wanted := int(cost["amount"])
+		for chest: Entity in chests:
 			if wanted <= 0:
 				break
 			if source_rank(chest) < 0:
@@ -488,22 +633,111 @@ func _withdraw(port: Entity, costs: Array) -> bool:
 			var storage := storage_of(chest)
 			if storage == null:
 				continue
-			var taken := storage.extract(item, wanted)
-			wanted -= taken
+			wanted -= storage.count_of(item)
 		if wanted > 0:
-			# Put back what was taken; the job waits for the rest.
-			var shortfall := int(cost["amount"]) - wanted
-			for chest: Entity in network.get("chests", []):
-				if shortfall <= 0:
-					break
-				if source_rank(chest) < 0:
-					continue
-				var storage := storage_of(chest)
-				if storage == null:
-					continue
-				shortfall -= storage.insert(item, shortfall)
 			return false
 	return true
+
+
+## Chests a construction robot may take from for a ghost.
+##
+## A storage/provider/buffer chest inside the logistic network is the normal
+## source.  A chest that stands near the build site but just outside the
+## roboport's logistics radius (inside its construction radius) is accepted
+## too: those are the "construction chests" players put next to an outpost,
+## and refusing them made robots idle with a full chest in sight.
+func _nearby_chests(port: Entity) -> Array:
+	var entry: Variant = _nearby_cache.get(port.origin)
+	if entry is Dictionary and _clock - int(entry["at"]) < 30:
+		return entry["chests"]
+	var reach := construction_radius(port)
+	var centre := port.center()
+	var chests: Array = []
+	for chest: Entity in world.entities_of_type("logistic-container"):
+		if chest.is_ghost() or source_rank(chest) < 0:
+			continue
+		if chest.center().distance_to(centre) <= reach:
+			chests.append(chest)
+	_nearby_cache[port.origin] = {"at": _clock, "chests": chests}
+	return chests
+
+
+func builder_sources(port: Entity, ghost_cell: Vector2i,
+		costs: Array = [], nearby: Array = [], nearby_ready := false) -> Array:
+	var network := network_of(port)
+	var chests: Array = (network.get("chests", []) as Array).duplicate()
+	if ghost_cell == Vector2i(2147483647, 2147483647):
+		return chests
+	# The common case is a network that can already pay; only then is it worth
+	# looking for chests near the build site.
+	if not costs.is_empty() and chests_can_pay(chests, costs):
+		return chests
+	var reach := construction_radius(port)
+	var target := Vector2(ghost_cell) + Vector2(0.5, 0.5)
+	var candidates := nearby if nearby_ready 		else world.entities_of_type("logistic-container")
+	for entity: Entity in candidates:
+		if entity.is_ghost() or source_rank(entity) < 0 or chests.has(entity):
+			continue
+		if entity.center().distance_to(target) <= reach:
+			chests.append(entity)
+	return chests
+
+
+func _withdraw(port: Entity, costs: Array,
+		ghost_cell := Vector2i(2147483647, 2147483647)) -> bool:
+	if costs.is_empty():
+		return true
+	var chests := builder_sources(port, ghost_cell, costs)
+	if not chests_can_pay(chests, costs):
+		return false
+	for cost: Dictionary in costs:
+		var wanted := int(cost["amount"])
+		var item := str(cost["name"])
+		for chest: Entity in chests:
+			if wanted <= 0:
+				break
+			if source_rank(chest) < 0:
+				continue
+			var storage := storage_of(chest)
+			if storage == null:
+				continue
+			wanted -= storage.extract(item, wanted)
+		if wanted > 0:
+			return false
+	return true
+
+
+## Remove a marked building, then leave the ghost its shift-paste planned.
+func _finish_deconstruction(task: Dictionary, robot: Dictionary) -> void:
+	var cell: Variant = task.get("deconstruct", null)
+	robot["state"] = "idle"
+	robot["task"] = {}
+	if not (cell is Vector2i):
+		return
+	var target := world.entity_at(cell as Vector2i)
+	if target == null:
+		return
+	var origin := target.origin
+	var followup: Dictionary = {}
+	for order: Dictionary in deconstruction:
+		if int(order.get("origin_x", 0)) == origin.x \
+				and int(order.get("origin_y", 0)) == origin.y:
+			followup = order.get("followup", {})
+			break
+	world.remove_entity(target)
+	for i in range(deconstruction.size() - 1, -1, -1):
+		var order: Dictionary = deconstruction[i]
+		if int(order.get("origin_x", 0)) == origin.x \
+				and int(order.get("origin_y", 0)) == origin.y:
+			deconstruction.remove_at(i)
+	_deconstructed += 1
+	if followup.is_empty():
+		return
+	var ghost := Entity.create(str(followup.get("type", "entity")),
+		str(followup.get("name", "")), origin, int(followup.get("direction", 0)))
+	if ghost.is_valid():
+		Blueprints._apply_state(ghost, followup)
+		world.place_ghost(ghost)
 
 
 ## Fly the construction robots, and build what they arrive at.
@@ -564,6 +798,12 @@ func _builder_target(robot: Dictionary) -> Vector2:
 			var entity := world.entity_at(ghost as Vector2i)
 			if entity != null:
 				return entity.center()
+	if state == "deconstruct":
+		var marked: Variant = task.get("deconstruct", null)
+		if marked is Vector2i:
+			var entity := world.entity_at(marked as Vector2i)
+			if entity != null:
+				return entity.center()
 	return _home_position(robot)
 
 
@@ -604,6 +844,8 @@ func _dispatch_personal() -> void:
 		var task: Dictionary = robot.get("task", {})
 		if task.has("ghost"):
 			claimed[str(task["ghost"])] = true
+		if task.has("deconstruct"):
+			claimed["d:" + str(task["deconstruct"])] = true
 
 	var centre := player.character.position
 	for entity: Entity in world.entities.values():
@@ -619,6 +861,24 @@ func _dispatch_personal() -> void:
 		robot["state"] = "ghost"
 		robot["task"] = {"ghost": entity.origin}
 		claimed[str(entity.origin)] = true
+
+	# The engineer's own robots also take apart what shift-paste marked.
+	for order: Dictionary in deconstruction:
+		var marked: Variant = order.get("entity")
+		if not (marked is Entity) or not world.entities.has((marked as Entity).origin):
+			continue
+		var entity: Entity = marked
+		if centre.distance_to(entity.center()) > radius:
+			continue
+		var key := "d:" + str(entity.origin)
+		if claimed.has(key):
+			continue
+		var robot := _free_personal_builder(limit)
+		if robot.is_empty():
+			return
+		robot["state"] = "deconstruct"
+		robot["task"] = {"deconstruct": entity.origin}
+		claimed[key] = true
 
 
 ## A free robot of the engineer's, or a new one if the suit allows another.
@@ -668,6 +928,9 @@ func _withdraw_personal(costs: Array) -> bool:
 
 func _arrive_builder(robot: Dictionary) -> void:
 	var task: Dictionary = robot.get("task", {})
+	if task.has("deconstruct"):
+		_finish_deconstruction(task, robot)
+		return
 	var ghost_cell: Variant = task.get("ghost", null)
 	if not (ghost_cell is Vector2i):
 		robot["state"] = "idle"
@@ -690,7 +953,7 @@ func _arrive_builder(robot: Dictionary) -> void:
 			robot["state"] = "idle"
 			robot["task"] = {}
 			return
-		if not _withdraw(port as Entity, _ghost_costs(ghost)):
+		if not _withdraw(port as Entity, _ghost_costs(ghost), ghost.origin):
 			robot["state"] = "idle"
 			robot["task"] = {}
 			return

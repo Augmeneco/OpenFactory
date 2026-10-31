@@ -22,6 +22,7 @@ var _recipe_grid: GridContainer
 var _search: LineEdit
 var _cursor_icon: TextureRect
 var _hint: Label
+var _cancel_crafting: Button
 var _slots: Array = []
 var _recipe_buttons: Array = []
 var _filter := ""
@@ -113,6 +114,15 @@ func _build_right_side() -> Control:
 	queue_body.add_child(_queue_row)
 	_hint = UiKit.label("", "label")
 	queue_body.add_child(_hint)
+	_cancel_crafting = UiKit.button("Cancel crafting", "button")
+	_cancel_crafting.tooltip_text = "Clear the queue and refund the started craft."
+	_cancel_crafting.pressed.connect(func() -> void:
+		var cancelled := player.cancel_crafting()
+		refresh()
+		if cancelled > 0:
+			_hint.text = "Cancelled %d craft%s." % [
+				cancelled, "" if cancelled == 1 else "s"])
+	queue_body.add_child(_cancel_crafting)
 	var tip := UiKit.label(
 		"Middle-click an item to put it on the selected quickbar slot. "
 		+ "Clicking a quickbar slot with an item on the cursor also assigns it.",
@@ -289,6 +299,8 @@ func _refresh_queue() -> void:
 		slot.refresh()
 		_queue_row.add_child(slot)
 		shown += 1
+	if _cancel_crafting != null:
+		_cancel_crafting.disabled = player.craft_queue.is_empty()
 	if player.creative:
 		_hint.text = "Creative: click a recipe to take its item directly."
 	elif player.craft_queue.is_empty():

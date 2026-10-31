@@ -17,6 +17,15 @@ var _grid: GridContainer
 var _cells: Array[Button] = []
 var _icons: Array[TextureRect] = []
 var _counts: Array[Label] = []
+## Panel order, independent of inventory order.  The first weapon slot is the
+## gun the player fires; the first ammo slot is the preferred magazine.
+var _weapon_order: Array = []
+var _ammo_order: Array = []
+var _drag_from := -1
+var _drag_kind := ""
+var _drag_started := false
+var _drag_press_global := Vector2.ZERO
+var _suppress_click := false
 
 
 func _init(player_: Player) -> void:
@@ -84,6 +93,7 @@ func _add_cell(index: int) -> void:
 	count.offset_bottom = -1
 	button.add_child(count)
 	button.pressed.connect(_on_cell_pressed.bind(index))
+	button.gui_input.connect(_on_cell_gui_input.bind(index))
 	_grid.add_child(button)
 	_cells.append(button)
 	_icons.append(icon)
@@ -113,10 +123,113 @@ func _on_cell_pressed(index: int) -> void:
 			equipment_requested.emit()
 		return
 	if index >= 1 and index <= 3:
+		if _suppress_click:
+			_suppress_click = false
+			return
 		var guns := _guns()
 		var weapon_index := index - 1
 		if weapon_index < guns.size():
-			player.select_weapon(str(guns[weapon_index]))
+			var gun_name := str(guns[weapon_index])
+			# Clicking a slot promotes it to the first slot, which is the
+			# active weapon.  Dragging can rearrange the other two.
+			_promote(_weapon_order, gun_name)
+			player.select_weapon(gun_name)
+			refresh()
+		return
+	if index >= 5 and index <= 7:
+		if _suppress_click:
+			_suppress_click = false
+			return
+		var ammo := _ammo()
+		var ammo_index := index - 5
+		if ammo_index < ammo.size():
+			var ammo_name := str(ammo[ammo_index])
+			_promote(_ammo_order, ammo_name)
+			player.preferred_ammo = ammo_name
+			refresh()
+
+
+## Drag a weapon or ammo icon onto another slot of the same kind.
+func _on_cell_gui_input(event: InputEvent, index: int) -> void:
+	if not (event is InputEventMouseButton):
+		if event is InputEventMouseMotion and _drag_from >= 0:
+			if (event as InputEventMouseMotion).relative.length() > 1.0:
+				_drag_started = true
+		return
+	var button := event as InputEventMouseButton
+	if button.button_index != MOUSE_BUTTON_LEFT:
+		return
+	if button.pressed:
+		if index in [1, 2, 3, 5, 6, 7]:
+			_drag_from = index
+			_drag_kind = "weapon" if index <= 3 else "ammo"
+			_drag_started = false
+			_drag_press_global = get_global_mouse_position()
+		return
+	_finish_drag()
+
+
+## Even if the release lands outside the source button, the drag still ends.
+func _process(_delta: float) -> void:
+	if _drag_from < 0:
+		return
+	if Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT):
+		if get_global_mouse_position().distance_to(_drag_press_global) > 4.0:
+			_drag_started = true
+		return
+	_finish_drag()
+
+
+func _finish_drag() -> void:
+	var from := _drag_from
+	var kind := _drag_kind
+	var started := _drag_started
+	_drag_from = -1
+	_drag_kind = ""
+	_drag_started = false
+	if not started:
+		return
+	var target := _cell_at(get_global_mouse_position())
+	if target < 0 or target == from:
+		return
+	if kind == "weapon" and not (target >= 1 and target <= 3):
+		return
+	if kind == "ammo" and not (target >= 5 and target <= 7):
+		return
+	_move_slot(from, target, kind)
+	_suppress_click = true
+	_clear_suppress_click.call_deferred()
+
+
+func _clear_suppress_click() -> void:
+	_suppress_click = false
+
+
+func _cell_at(point: Vector2) -> int:
+	for index in _cells.size():
+		if _cells[index].get_global_rect().has_point(point):
+			return index
+	return -1
+
+
+func _move_slot(from: int, to: int, kind: String) -> void:
+	# _guns()/_ammo() rebuild and may replace the order array, so take the
+	# returned array as the one to mutate.
+	var names: Array = _guns() if kind == "weapon" else _ammo()
+	var order := names
+	var from_index := from - (1 if kind == "weapon" else 5)
+	var to_index := to - (1 if kind == "weapon" else 5)
+	if from_index < 0 or from_index >= names.size() or to_index < 0:
+		return
+	var name := str(names[from_index])
+	order.erase(name)
+	to_index = mini(to_index, order.size())
+	order.insert(to_index, name)
+	if kind == "weapon":
+		player.select_weapon(str(order[0]))
+	else:
+		player.preferred_ammo = str(order[0])
+	refresh()
 
 
 func _has_armor_grid() -> bool:
@@ -126,9 +239,9 @@ func _has_armor_grid() -> bool:
 
 
 func _guns() -> Array:
-	var out: Array = []
+	var owned: Array = []
 	if player == null:
-		return out
+		return owned
 	var seen: Dictionary = {}
 	for slot: Variant in player.inventory.slots:
 		if slot == null:
@@ -137,19 +250,21 @@ func _guns() -> Array:
 		if seen.has(name) or Prototypes.get_p("gun", name).is_empty():
 			continue
 		seen[name] = true
-		out.append(name)
-	out.sort_custom(func(a: String, b: String) -> bool:
+		owned.append(name)
+	owned.sort_custom(func(a: String, b: String) -> bool:
 		return Prototypes.item_sort_key(a) < Prototypes.item_sort_key(b))
-	return out
+	_weapon_order = _ordered(_weapon_order, owned)
+	return _weapon_order
 
 
 func _ammo() -> Array:
-	var out: Array = []
+	var owned: Array = []
 	if player == null:
-		return out
+		return owned
 	var gun := player.selected_gun()
 	if gun.is_empty():
-		return out
+		_ammo_order = []
+		return owned
 	var attack: Dictionary = Prototypes.get_p("gun", gun).get(
 		"attack_parameters", {})
 	var category := str(attack.get("ammo_category", ""))
@@ -164,8 +279,31 @@ func _ammo() -> Array:
 		if seen.has(name):
 			continue
 		seen[name] = true
-		out.append(name)
+		owned.append(name)
+	_ammo_order = _ordered(_ammo_order, owned)
+	return _ammo_order
+
+
+## Keep the player's order for names that still exist, then append new ones.
+static func _ordered(order: Array, owned: Array) -> Array:
+	var out: Array = []
+	var used: Dictionary = {}
+	for name: Variant in order:
+		if owned.has(name) and not used.has(name):
+			used[name] = true
+			out.append(name)
+	for name: Variant in owned:
+		if not used.has(name):
+			used[name] = true
+			out.append(name)
 	return out
+
+
+static func _promote(order: Array, name: String) -> void:
+	var index := order.find(name)
+	if index > 0:
+		order.remove_at(index)
+		order.push_front(name)
 
 
 func refresh() -> void:
@@ -190,6 +328,8 @@ func refresh() -> void:
 		if _has_armor_grid() else "Click to wear an armour suit"
 
 	var guns := _guns()
+	if not guns.is_empty() and player.selected_weapon != str(guns[0]):
+		player.select_weapon(str(guns[0]))
 	var selected := player.selected_gun()
 	for weapon_index in 3:
 		var cell_index := weapon_index + 1
@@ -198,7 +338,7 @@ func refresh() -> void:
 			_icons[cell_index].texture = FactorioAssets.prototype_icon(
 				Prototypes.item_proto(gun_name), 64)
 			_counts[cell_index].text = str(player.inventory.count_of(gun_name))
-			_cells[cell_index].tooltip_text = Loc.proto_name("item", gun_name)
+			_cells[cell_index].tooltip_text = "%s\nClick to select. C / Space fires." % Loc.proto_name("item", gun_name)
 			_cells[cell_index].modulate = Color(0.7, 1.0, 0.7, 1) \
 				if gun_name == selected else Color(1, 1, 1, 1)
 		else:
@@ -215,6 +355,9 @@ func refresh() -> void:
 		if _has_armor_grid() else "Click to wear an armour suit"
 
 	var ammo_names := _ammo()
+	if not ammo_names.is_empty() \
+			and player.preferred_ammo != str(ammo_names[0]):
+		player.preferred_ammo = str(ammo_names[0])
 	for ammo_index in 3:
 		var cell_index := ammo_index + 5
 		if ammo_index < ammo_names.size():

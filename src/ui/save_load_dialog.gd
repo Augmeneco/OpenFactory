@@ -6,6 +6,7 @@ extends Control
 
 signal save_requested(name: String)
 signal load_requested(path: String)
+signal save_deleted(path: String)
 signal cancelled
 
 var _mode := "load"
@@ -15,6 +16,13 @@ var _name_edit: LineEdit
 var _list_box: VBoxContainer
 var _hint: Label
 var _action: Button
+var _save_current: Button
+var _delete: Button
+var _confirm_delete: ConfirmationDialog
+var _pending_delete_path := ""
+var _pending_delete_name := ""
+var _current_name := ""
+var _current_path := ""
 var _selected_path := ""
 var _built := false
 
@@ -66,6 +74,14 @@ func _build() -> void:
 
 	var buttons := UiKit.row(8)
 	buttons.alignment = BoxContainer.ALIGNMENT_END
+	_delete = UiKit.button("Delete", "button")
+	_delete.disabled = true
+	_delete.pressed.connect(_on_delete)
+	buttons.add_child(_delete)
+	_save_current = UiKit.button("Save current", "button")
+	_save_current.visible = false
+	_save_current.pressed.connect(_on_save_current)
+	buttons.add_child(_save_current)
 	var cancel := UiKit.button("Cancel", "button")
 	cancel.pressed.connect(func() -> void:
 		visible = false
@@ -76,21 +92,37 @@ func _build() -> void:
 	buttons.add_child(_action)
 	body.add_child(buttons)
 
+	_confirm_delete = ConfirmationDialog.new()
+	_confirm_delete.title = "Delete save"
+	_confirm_delete.ok_button_text = "Delete"
+	_confirm_delete.cancel_button_text = "Cancel"
+	_confirm_delete.confirmed.connect(_do_delete)
+	add_child(_confirm_delete)
 
-func open_save(default_name: String) -> void:
+
+func open_save(default_name: String, current_name := "",
+		current_path := "") -> void:
 	if not _built:
 		await ready
 	_mode = "save"
 	_title.text = "Save game"
+	_current_name = current_name
+	_current_path = current_path
 	_hint.text = "Choose a name. Saving under an existing name replaces that save."
 	_name_row.visible = true
-	_name_edit.text = default_name
+	# Opening the dialog on an already-loaded save pre-selects that name, so
+	# Save simply overwrites it instead of creating another factory.
+	_name_edit.text = current_name if not current_name.is_empty() else default_name
 	_name_edit.grab_focus()
 	_action.text = "Save"
 	_action.disabled = false
+	_save_current.visible = true
+	_save_current.disabled = current_name.is_empty()
 	_selected_path = ""
+	_delete.disabled = true
 	visible = true
 	_refresh()
+	_select_current()
 
 
 func open_load() -> void:
@@ -101,8 +133,10 @@ func open_load() -> void:
 	_hint.text = "Select a save, then press Load."
 	_name_row.visible = false
 	_action.text = "Load"
+	_save_current.visible = false
 	_selected_path = ""
 	_action.disabled = true
+	_delete.disabled = true
 	visible = true
 	_refresh()
 
@@ -110,23 +144,39 @@ func open_load() -> void:
 func _refresh() -> void:
 	if _list_box == null:
 		return
+	_delete.disabled = true
 	for child: Node in _list_box.get_children():
 		child.queue_free()
 	var saves := SaveGame.list_saves()
 	if saves.is_empty():
 		_list_box.add_child(UiKit.label(
 			"No named saves yet. Save a game first.", "label"))
-		_action.disabled = true
+		_action.disabled = _mode == "load"
 		return
 	for entry: Dictionary in saves:
 		var button := UiKit.button(_entry_text(entry), "button")
 		button.alignment = HORIZONTAL_ALIGNMENT_LEFT
-		button.tooltip_text = "Double-click to load"
+		button.tooltip_text = "Double-click to load" if _mode == "load" \
+			else "Double-click to overwrite this save"
+		button.set_meta("save_path", str(entry.get("path", "")))
+		button.set_meta("save_entry", entry)
 		button.pressed.connect(_select.bind(entry, button))
 		button.gui_input.connect(_on_entry_input.bind(entry, button))
 		_list_box.add_child(button)
 	if _mode == "load":
 		_action.disabled = _selected_path.is_empty()
+	if _selected_path.is_empty():
+		_delete.disabled = true
+
+
+## Highlight the save the game was loaded from, if it is in the list.
+func _select_current() -> void:
+	if _current_path.is_empty():
+		return
+	for child: Node in _list_box.get_children():
+		if child is Button and str(child.get_meta("save_path", "")) == _current_path:
+			_select(child.get_meta("save_entry"), child as Button)
+			return
 
 
 func _entry_text(entry: Dictionary) -> String:
@@ -156,11 +206,69 @@ func _on_entry_input(event: InputEvent, entry: Dictionary,
 func _select(entry: Dictionary, button: Button) -> void:
 	_selected_path = str(entry.get("path", ""))
 	_action.disabled = false
-	_hint.text = "Selected: %s" % str(entry.get("name", ""))
+	_delete.disabled = false
+	if _mode == "save":
+		# Clicking a save in save mode adopts its name; the Save button then
+		# overwrites that file instead of creating a new one.
+		_name_edit.text = str(entry.get("name", ""))
+		_hint.text = "Selected: %s — Save overwrites it." % str(entry.get("name", ""))
+	else:
+		_hint.text = "Selected: %s" % str(entry.get("name", ""))
 	for child: Node in _list_box.get_children():
 		if child is Button:
 			(child as Button).modulate = Color(1, 1, 1, 1) \
 				if child == button else Color(0.75, 0.75, 0.75, 1)
+
+
+## Save straight into the save the game came from, without touching the name.
+func _on_save_current() -> void:
+	if _current_name.is_empty():
+		_hint.text = "No current save to overwrite. Give this one a name first."
+		return
+	visible = false
+	save_requested.emit(_current_name)
+
+
+func _on_delete() -> void:
+	if _selected_path.is_empty():
+		return
+	var entry_name := _name_edit.text.strip_edges()
+	if _mode == "load":
+		entry_name = _selected_path.get_file().get_basename()
+	# Prefer the selected row's displayed name when deleting from the browser.
+	if _list_box != null:
+		for child: Node in _list_box.get_children():
+			if child is Button and str(child.get_meta("save_path", "")) == _selected_path:
+				var entry: Variant = child.get_meta("save_entry", {})
+				if entry is Dictionary:
+					entry_name = str((entry as Dictionary).get("name", entry_name))
+				break
+	_pending_delete_path = _selected_path
+	_pending_delete_name = entry_name
+	_confirm_delete.dialog_text = "Delete save '%s'?\nThis cannot be undone." % entry_name
+	_confirm_delete.popup_centered()
+
+
+func _do_delete() -> void:
+	if _pending_delete_path.is_empty():
+		return
+	var path := _pending_delete_path
+	var name := _pending_delete_name
+	_pending_delete_path = ""
+	_pending_delete_name = ""
+	if not SaveGame.delete_save(path):
+		_hint.text = "Could not delete %s." % name
+		return
+	if path == _current_path:
+		_current_path = ""
+		_current_name = ""
+		_save_current.disabled = true
+	_selected_path = ""
+	_delete.disabled = true
+	_action.disabled = _mode == "load"
+	_hint.text = "Deleted %s." % name
+	_refresh()
+	save_deleted.emit(path)
 
 
 func _on_action() -> void:

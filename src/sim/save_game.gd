@@ -225,13 +225,18 @@ static func restore_into(data: Dictionary, world: GameWorld, sim: Simulation,
 			continue
 		_decode_state(entity, saved_state)
 
+	# Older saves could contain two exits fed by one entrance, because the
+	# role was stored per half instead of derived from the pairing.  Deriving
+	# it now keeps every tunnel one-to-one.
+	world.normalize_underground()
+
 	research.researched.clear()
 	_restore_research(research, data.get("research", {}))
 
 	# Pollution and the biters it drew.
 	sim.pollution.from_dict(data.get("pollution", {}))
 	sim.evolution_speed = float(data.get("evolution_speed", 1.0))
-	sim.enemy_safe_chunks = int(data.get("enemy_safe_chunks", 14))
+	sim.enemy_safe_chunks = int(data.get("enemy_safe_chunks", 5))
 	var safe_values: Variant = data.get("enemy_safe_center", [0, 0])
 	if safe_values is Array and (safe_values as Array).size() >= 2:
 		sim.enemy_safe_center = Vector2i(int(safe_values[0]), int(safe_values[1]))
@@ -239,6 +244,8 @@ static func restore_into(data: Dictionary, world: GameWorld, sim: Simulation,
 	sim._elapsed_seconds = float(data.get("elapsed_seconds", 0.0))
 	sim._pollution_produced = float(data.get("pollution_produced", 0.0))
 	sim.units.clear()
+	sim.corpses.clear()
+	sim.acid_puddles.clear()
 	for entry: Variant in data.get("units", []):
 		if not (entry is Dictionary):
 			continue
@@ -398,6 +405,17 @@ static func write_named(data: Dictionary, display_name: String) -> String:
 	data["save_name"] = clean
 	data["saved_at"] = Time.get_datetime_string_from_system()
 	return path if write_file(path, data) else ""
+
+
+## Delete a named save.  Only paths inside the save directory (or the legacy
+## fixed-path save) are accepted, so the dialog cannot remove arbitrary files.
+static func delete_save(path: String) -> bool:
+	if not (path.begins_with(SAVE_DIR + "/") or path == LEGACY_SAVE_PATH):
+		return false
+	if not FileAccess.file_exists(path):
+		return false
+	var absolute := ProjectSettings.globalize_path(path)
+	return DirAccess.remove_absolute(absolute) == OK
 
 
 ## Every valid save, newest first, including the old fixed-path save so an
