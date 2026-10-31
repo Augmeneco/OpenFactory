@@ -1,9 +1,54 @@
 #!/usr/bin/env bash
+# Build the Linux executable.  WebP textures are optional and cut the PCK:
+#
+#   tools/build_linux.sh
+#   tools/build_linux.sh --webp
+#   tools/build_linux.sh --webp --webp-quality 70 --jobs 8
+#   tools/build_linux.sh --webp --clean     # throw away staging first
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 PROJECT="$(pwd)"
 STAGE="$PROJECT/.export_stage"
+WEBP_ARGS=()
+PREP_MODE=(--resume)
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --webp)
+            WEBP_ARGS+=(--webp)
+            shift
+            ;;
+        --clean)
+            PREP_MODE=(--force)
+            shift
+            ;;
+        --webp-quality)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --webp-quality needs a number" >&2
+                exit 2
+            fi
+            WEBP_ARGS+=(--webp --webp-quality "$2")
+            shift 2
+            ;;
+        --jobs)
+            if [ "$#" -lt 2 ]; then
+                echo "error: --jobs needs a number" >&2
+                exit 2
+            fi
+            WEBP_ARGS+=(--jobs "$2")
+            shift 2
+            ;;
+        -h|--help)
+            sed -n '2,12p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown option: $1" >&2
+            exit 2
+            ;;
+    esac
+done
 
 cleanup() {
     rm -rf "$STAGE"
@@ -13,7 +58,7 @@ trap cleanup EXIT
 # Stage only files that belong in the shipped game.  Exporting directly from
 # the repository would also pick up tmp_preview/, tools/ and build/ on this
 # Godot version's Linux exporter.
-python3 tools/prepare_export_data.py --force
+python3 tools/prepare_export_data.py "${PREP_MODE[@]}" "${WEBP_ARGS[@]}"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
 

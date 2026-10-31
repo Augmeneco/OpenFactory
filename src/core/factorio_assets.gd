@@ -123,7 +123,7 @@ func _load_image(source: String, original_path: String) -> Image:
 	var magic := bytes.slice(0, 4).get_string_from_ascii()
 	var error := ERR_FILE_UNRECOGNIZED
 	if magic == "RIFF" and bytes.size() >= 12 \
-			and bytes.slice(8, 4).get_string_from_ascii() == "WEBP":
+			and bytes.slice(8, 12).get_string_from_ascii() == "WEBP":
 		error = image.load_webp_from_buffer(bytes)
 	elif bytes.size() >= 4 and bytes[0] == 0x89 \
 			and bytes.slice(1, 3).get_string_from_ascii() == "PNG":
